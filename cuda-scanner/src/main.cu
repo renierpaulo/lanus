@@ -508,25 +508,76 @@ __global__ void search_kernel_v2(
     
     atomicAdd((unsigned long long*)valid_count, 1ULL);
     
-    // Reconstruir frase mnemônica (otimizado: evitar strlen)
-    char mnemonic[256];
-    uint32_t mnemonic_len = 0;
-    
-    #pragma unroll 1
-    for (uint32_t i = 0; i < s_word_count; i++) {
-        if (i > 0) mnemonic[mnemonic_len++] = ' ';
-        const char* word = d_wordlist[indices[i]];
-        #pragma unroll 8
-        for (int c = 0; c < 8 && word[c]; c++) {
-            mnemonic[mnemonic_len++] = word[c];
+#include "pbkdf2_opt.cuh" // Make sure this is included at top of file
+
+// ... inside kernel ...
+
+    // Hashing da frase mnemônica diretamente dos índices (sem construir string)
+    // Se a frase > 128 bytes (o que é verdade para 24 palavras), o PBKDF2 usa SHA512(frase) como chave.
+    // Vamos calcular esse hash diretamente.
+    uint8_t mnemonic_hash[64];
+    {
+        SHA512State ctx;
+        sha512_init_state(&ctx);
+        
+        uint8_t block[128];
+        uint32_t buf_len = 0;
+        uint64_t total_len = 0;
+        
+        #pragma unroll 1
+        for (uint32_t i = 0; i < s_word_count; i++) {
+            if (i > 0) {
+                block[buf_len++] = ' ';
+                if (buf_len == 128) {
+                    sha512_transform_block_raw(&ctx, block);
+                    buf_len = 0;
+                    total_len += 128;
+                }
+            }
+            const char* word = d_wordlist[indices[i]];
+            #pragma unroll 8
+            for (int c = 0; c < 8 && word[c]; c++) {
+                block[buf_len++] = word[c];
+                if (buf_len == 128) {
+                    sha512_transform_block_raw(&ctx, block);
+                    buf_len = 0;
+                    total_len += 128;
+                }
+            }
         }
+        
+        total_len += buf_len;
+        
+        // Finalizar SHA512 (padding)
+        block[buf_len++] = 0x80;
+        if (buf_len > 112) {
+            while (buf_len < 128) block[buf_len++] = 0;
+            sha512_transform_block_raw(&ctx, block);
+            buf_len = 0;
+        }
+        while (buf_len < 112) block[buf_len++] = 0;
+        
+        uint64_t bit_len = total_len * 8;
+        // Big-endian length at end
+        for(int i=0; i<8; i++) block[112+i] = 0;
+        block[120] = (bit_len >> 56) & 0xFF;
+        block[121] = (bit_len >> 48) & 0xFF;
+        block[122] = (bit_len >> 40) & 0xFF;
+        block[123] = (bit_len >> 32) & 0xFF;
+        block[124] = (bit_len >> 24) & 0xFF;
+        block[125] = (bit_len >> 16) & 0xFF;
+        block[126] = (bit_len >> 8) & 0xFF;
+        block[127] = bit_len & 0xFF;
+        
+        sha512_transform_block_raw(&ctx, block);
+        sha512_extract(&ctx, mnemonic_hash);
     }
-    mnemonic[mnemonic_len] = '\0';
     
-    // Derivar seed via PBKDF2
+    // Derivar seed via PBKDF2 Otimizado
     uint8_t seed[64];
-    const char* salt = "mnemonic";
-    pbkdf2_sha512((const uint8_t*)mnemonic, mnemonic_len, (const uint8_t*)salt, 8, PBKDF2_ITERATIONS, seed, 64);
+    const char* salt = "mnemonic"; // Salt é 'mnemonic' + passphrase. Aqui sem passphrase.
+    // Otimização: Passamos o hash da frase (64 bytes) como chave
+    pbkdf2_sha512_optimized(mnemonic_hash, (const uint8_t*)salt, 8, PBKDF2_ITERATIONS, seed);
     
     // Master key/chaincode derivada uma vez por seed
     uint8_t master_key[32];
