@@ -33,8 +33,6 @@
 
 static uint32_t g_threads_per_block = 256;
 static uint32_t g_batch_size_millions = 4;
-static uint32_t g_num_streams = 4;  // Número de streams por GPU
-static bool g_multi_gpu = true;     // Usar todas as GPUs disponíveis
 #define MAX_ADDRESSES 10000000
 #define PBKDF2_ITERATIONS 2048
 #define MAGIC_V2 0x42495034  // "BIP4"

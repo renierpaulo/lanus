@@ -38,10 +38,15 @@ __device__ __forceinline__ uint64_t rotr64(uint64_t x, uint32_t n) {
 
 // BSWAP64 for endian conversion - accelerated
 __device__ __forceinline__ uint64_t bswap64(uint64_t x) {
-    uint64_t out;
-    asm("byte_perm.b16 %0, %1, 0, 0x0123;" : "=l"(out) : "l"(x)); // actually complex on 32-bit registers but optimized on 64-bit
-    // For 64-bit values on standard CUDA, better use built-in or byte_perm on halves
-    return __byte_perm(x, 0, 0x01237654); // Just a placeholder, NVCC optimizes well.
+    // NVCC optimizes standard shifts to specific hardware instructions
+    return (x >> 56) | 
+           ((x >> 40) & 0x00FF000000000000ULL) |
+           ((x >> 24) & 0x0000FF0000000000ULL) |
+           ((x >> 8)  & 0x000000FF00000000ULL) |
+           ((x << 8)  & 0x00000000FF000000ULL) |
+           ((x << 24) & 0x0000000000FF0000ULL) |
+           ((x << 40) & 0x000000000000FF00ULL) |
+           (x << 56);
 }
 
 __device__ __forceinline__ uint64_t ch64(uint64_t x, uint64_t y, uint64_t z) {
