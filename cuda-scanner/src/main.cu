@@ -100,7 +100,7 @@ __constant__ uint32_t d_word_count;
 __constant__ uint64_t d_factorials[25];
 
 // Endereços alvo em formato hash
-__constant__ uint8_t d_target_hashes[MAX_ADDRESSES][20];
+__device__ uint8_t* d_target_hashes_ptr = nullptr;
 __constant__ uint32_t d_num_targets;
 
 __device__ uint8_t* d_bloom_bits = nullptr;
@@ -608,7 +608,7 @@ __global__ void search_kernel_v2(
         for (uint32_t t = 0; t < d_num_targets; t++) {
             bool match = true;
             for (int j = 0; j < 20; j++) {
-                if (pubkey_hash[j] != d_target_hashes[t][j]) { match = false; break; }
+                if (pubkey_hash[j] != d_target_hashes_ptr[t * 20 + j]) { match = false; break; }
             }
             if (match) {
                 found = true;
@@ -631,7 +631,7 @@ __global__ void search_kernel_v2(
             for (uint32_t t = 0; t < d_num_targets; t++) {
                 bool match = true;
                 for (int j = 0; j < 20; j++) {
-                    if (pubkey_hash[j] != d_target_hashes[t][j]) { match = false; break; }
+                    if (pubkey_hash[j] != d_target_hashes_ptr[t * 20 + j]) { match = false; break; }
                 }
                 if (match) {
                     found = true;
@@ -890,11 +890,15 @@ void gpu_worker(
     cudaMemcpyToSymbol(d_factorials, h_factorials, sizeof(uint64_t) * 25);
     
     uint8_t* d_bloom_bits_ptr = nullptr;
+    uint8_t* d_targets_gpu = nullptr;
     
     if (use_bloom) {
         load_bloom(bloom_file, &d_bloom_bits_ptr);
     } else {
-        cudaMemcpyToSymbol(d_target_hashes, h_target_hashes, num_targets * 20);
+        cudaMalloc(&d_targets_gpu, num_targets * 20 * sizeof(uint8_t));
+        cudaMemcpy(d_targets_gpu, h_target_hashes, num_targets * 20 * sizeof(uint8_t), cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(d_target_hashes_ptr, &d_targets_gpu, sizeof(uint8_t*));
+        
         cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(uint32_t));
     }
     
@@ -1017,6 +1021,7 @@ void gpu_worker(
     }
     
     if (d_bloom_bits_ptr) cudaFree(d_bloom_bits_ptr);
+    if (d_targets_gpu) cudaFree(d_targets_gpu);
     
     {
         std::lock_guard<std::mutex> lock(g_print_mutex);
