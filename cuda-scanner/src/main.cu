@@ -321,29 +321,32 @@ __device__ void derive_path(
 // ============================================================================
 // Aritmética u128 para CUDA
 // ============================================================================
-__device__ __forceinline__ uint128_t make_u128(uint64_t lo, uint64_t hi) {
+// ============================================================================
+// Aritmética u128 para CUDA
+// ============================================================================
+__host__ __device__ __forceinline__ uint128_t make_u128(uint64_t lo, uint64_t hi) {
     uint128_t r; r.lo = lo; r.hi = hi; return r;
 }
 
-__device__ __forceinline__ uint128_t u128_add(uint128_t a, uint64_t b) {
+__host__ __device__ __forceinline__ uint128_t u128_add(uint128_t a, uint64_t b) {
     uint128_t r;
     r.lo = a.lo + b;
     r.hi = a.hi + (r.lo < a.lo ? 1 : 0);
     return r;
 }
 
-__device__ __forceinline__ uint128_t u128_sub(uint128_t a, uint128_t b) {
+__host__ __device__ __forceinline__ uint128_t u128_sub(uint128_t a, uint128_t b) {
     uint128_t r;
     r.lo = a.lo - b.lo;
     r.hi = a.hi - b.hi - (a.lo < b.lo ? 1 : 0);
     return r;
 }
 
-__device__ __forceinline__ bool u128_lt(uint128_t a, uint128_t b) {
+__host__ __device__ __forceinline__ bool u128_lt(uint128_t a, uint128_t b) {
     return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo);
 }
 
-__device__ __forceinline__ uint64_t u128_div_u64(uint128_t* a, uint64_t b) {
+__host__ __device__ __forceinline__ uint64_t u128_div_u64(uint128_t* a, uint64_t b) {
     // Divisão simplificada para caso hi == 0
     if (a->hi == 0) {
         uint64_t q = a->lo / b;
@@ -351,12 +354,19 @@ __device__ __forceinline__ uint64_t u128_div_u64(uint128_t* a, uint64_t b) {
         return q;
     }
     // Para hi != 0, fazer divisão longa (simplificada)
+    // No host (especialmente Windows) __uint128_t pode não existir, cuidar com #ifdef se necessário
+    // Assumindo ambiente Linux/GCC ou NVCC moderno que suporta __int128
+#if defined(__CUDA_ARCH__) || defined(__GNUC__)
     __uint128_t val = ((__uint128_t)a->hi << 64) | a->lo;
-    uint64_t q = val / b;
-    uint64_t rem = val % b;
+    uint64_t q = (uint64_t)(val / b);
+    uint64_t rem = (uint64_t)(val % b);
     a->lo = rem;
     a->hi = 0;
     return q;
+#else
+    // Fallback lento ou erro se não tiver 128 bit type no host compiler (Ex: MSVC antigo)
+    return 0; // TODO implement proper fallback if needed
+#endif
 }
 
 __device__ __forceinline__ uint64_t fnv1a64_dev(const uint8_t* data, int len, uint64_t seed) {

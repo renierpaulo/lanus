@@ -9,9 +9,9 @@
 #include <stdint.h>
 #include <string.h>
 
-__constant__ char BECH32_CHARSET[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+static const char BECH32_CHARSET[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
-__constant__ int8_t BECH32_MAP[128] = {
+static const int8_t BECH32_MAP[128] = {
     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
