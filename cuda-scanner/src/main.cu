@@ -1350,10 +1350,7 @@ int main(int argc, char** argv) {
         for(uint32_t w=0; w<word_count_job; w++) printf("%s ", cur_words[w]);
         fflush(stdout);
 
-        bool all_done = true;
-        for (auto& t : gpu_threads) if (t.joinable()) all_done = false; 
-        
-        // Use a break condition? For this loop, user likely wants to run until exhausted or found.
+        // Check for completion based on progress
         if (processed >= ranges_ptr[0].count.lo && ranges_ptr[0].count.hi == 0) {
              printf("\nExploração concluída.\n");
              break;
