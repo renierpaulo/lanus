@@ -1328,18 +1328,15 @@ int main(int argc, char** argv) {
             sprintf(privkey_hex + i*2, "%02x", h_last_valid.private_key[i]);
         }
 
-        // Build address from pubkey_hash (P2PKH format)
+        // Build address from pubkey_hash (P2PKH format) - host side
         char address[64] = "";
         {
-            uint8_t addr_bytes[25];
-            addr_bytes[0] = 0x00; // mainnet P2PKH
-            memcpy(addr_bytes + 1, h_last_valid.pubkey_hash, 20);
-            // Checksum
-            uint8_t sha1[32], sha2[32];
-            sha256(addr_bytes, 21, sha1);
-            sha256(sha1, 32, sha2);
-            memcpy(addr_bytes + 21, sha2, 4);
-            base58_encode(addr_bytes, 25, address);
+            // Use simplified hex display of pubkey_hash for now
+            // Full base58 encoding requires host SHA256 which we don't have
+            // Show first 8 bytes of hash as identifier
+            sprintf(address, "1...(hash:%02x%02x%02x%02x)", 
+                    h_last_valid.pubkey_hash[0], h_last_valid.pubkey_hash[1],
+                    h_last_valid.pubkey_hash[2], h_last_valid.pubkey_hash[3]);
         }
 
         uint64_t valid = g_total_valid.load();
