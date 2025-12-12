@@ -1,0 +1,1170 @@
+/*
+ * BIP39 CUDA Scanner v3.0 - Máxima Performance
+ * 
+ * Arquitetura "Range Only" com:
+ * - Multi-GPU automático
+ * - CUDA Streams para overlap de compute/transfer
+ * - Shared memory para constantes críticas
+ * - Tabela pré-computada de G para EC
+ * 
+ * Suporta derivações: m/44'/0'/0'/0 (Legacy) e m/84'/0'/0'/0 (SegWit)
+ */
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <mutex>
+
+#include "sha256.cuh"
+#include "sha512.cuh"
+#include "ripemd160.cuh"
+#include "secp256k1.cuh"
+#include "bip39.cuh"
+#include "base58.cuh"
+#include "bech32.cuh"
+
+// Configurações - agora configuráveis via argumentos
+static uint32_t g_threads_per_block = 256;
+static uint32_t g_batch_size_millions = 4;
+static uint32_t g_num_streams = 4;  // Número de streams por GPU
+static bool g_multi_gpu = true;     // Usar todas as GPUs disponíveis
+#define MAX_ADDRESSES 10000000
+#define PBKDF2_ITERATIONS 2048
+#define MAGIC_V2 0x42495034  // "BIP4"
+#define NUM_STREAMS 4
+
+// Variáveis globais para multi-threading
+std::atomic<uint64_t> g_total_processed(0);
+std::atomic<uint64_t> g_total_valid(0);
+std::atomic<uint32_t> g_total_found(0);
+std::mutex g_print_mutex;
+std::mutex g_file_mutex;
+
+// Estrutura para u128 (CUDA não tem suporte nativo)
+typedef struct {
+    uint64_t lo;
+    uint64_t hi;
+} uint128_t;
+
+// Estruturas
+struct RangeHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t word_count;
+    uint32_t num_ranges;
+};
+
+struct Range {
+    uint128_t start;
+    uint128_t count;
+};
+
+struct FoundResult {
+    uint128_t k_value;
+    uint8_t mnemonic_indices[48]; // max 24 words * 2 bytes
+    uint8_t private_key[32];
+    uint8_t derivation_path; // 0 = m/44', 1 = m/84'
+};
+
+struct BloomHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t m_bits;
+    uint32_t k;
+    uint32_t reserved;
+    uint64_t n_items;
+};
+
+// Contexto por GPU para multi-GPU
+struct GPUContext {
+    int device_id;
+    cudaStream_t streams[NUM_STREAMS];
+    uint64_t* d_valid_count[NUM_STREAMS];
+    uint64_t* d_tested_count[NUM_STREAMS];
+    uint8_t* d_bloom_bits;
+};
+
+// Constantes para BIP39 wordlist
+__constant__ char d_wordlist[2048][9];
+
+// Índices base das 24 palavras fixas
+__constant__ uint16_t d_base_indices[24];
+__constant__ uint32_t d_word_count;
+
+// Fatoriais pré-calculados (até 24!)
+__constant__ uint64_t d_factorials[25];
+
+// Endereços alvo em formato hash
+__constant__ uint8_t d_target_hashes[MAX_ADDRESSES][20];
+__constant__ uint32_t d_num_targets;
+
+__device__ uint8_t* d_bloom_bits = nullptr;
+__constant__ uint64_t d_bloom_m_bits = 0;
+__constant__ uint32_t d_bloom_k = 0;
+__constant__ uint32_t d_use_bloom = 0;
+
+// Resultados encontrados
+__device__ FoundResult d_found_results[1024];
+__device__ uint32_t d_found_count = 0;
+
+// ============================================================================
+// PBKDF2-SHA512 para derivação de seed
+// ============================================================================
+__device__ void pbkdf2_sha512(
+    const uint8_t* password, uint32_t password_len,
+    const uint8_t* salt, uint32_t salt_len,
+    uint32_t iterations,
+    uint8_t* output, uint32_t output_len
+) {
+    uint8_t U[64], T[64];
+    uint8_t block_salt[128];
+
+    // Pré-calcular k_ipad/k_opad para a password (HMAC) uma vez
+    uint8_t key_buf[64];
+    uint32_t key_len = password_len;
+    const uint8_t* key_ptr = password;
+
+    if (key_len > 128) {
+        // Se chave > 128 bytes, usar SHA512(password) como chave (64 bytes)
+        sha512(password, key_len, key_buf);
+        key_ptr = key_buf;
+        key_len = 64;
+    }
+
+    uint8_t k_ipad[128];
+    uint8_t k_opad[128];
+    for (int i = 0; i < 128; i++) {
+        uint8_t kb = (i < key_len) ? key_ptr[i] : 0;
+        k_ipad[i] = kb ^ 0x36;
+        k_opad[i] = kb ^ 0x5c;
+    }
+
+    memcpy(block_salt, salt, salt_len);
+    
+    uint32_t blocks = (output_len + 63) / 64;
+    
+    for (uint32_t block = 1; block <= blocks; block++) {
+        // Preparar salt com contador de bloco
+        block_salt[salt_len] = (block >> 24) & 0xFF;
+        block_salt[salt_len + 1] = (block >> 16) & 0xFF;
+        block_salt[salt_len + 2] = (block >> 8) & 0xFF;
+        block_salt[salt_len + 3] = block & 0xFF;
+        
+        // U1 = PRF(Password, Salt || INT(i))
+        hmac_sha512_pads(k_ipad, k_opad, block_salt, salt_len + 4, U);
+        memcpy(T, U, 64);
+        
+        // U2...Uc
+        for (uint32_t i = 1; i < iterations; i++) {
+            hmac_sha512_pads(k_ipad, k_opad, U, 64, U);
+            for (int j = 0; j < 64; j++) {
+                T[j] ^= U[j];
+            }
+        }
+        
+        // Copiar resultado
+        uint32_t copy_len = 64;
+        if (block == blocks) {
+            copy_len = output_len - (block - 1) * 64;
+        }
+        memcpy(output + (block - 1) * 64, T, copy_len);
+    }
+}
+
+// ============================================================================
+// Derivação BIP32/BIP44/BIP84
+// ============================================================================
+__device__ void derive_child_key(
+    const uint8_t* parent_key,
+    const uint8_t* parent_chaincode,
+    uint32_t index,
+    uint8_t* child_key,
+    uint8_t* child_chaincode,
+    bool hardened
+) {
+    uint8_t data[37];
+    uint8_t I[64];
+    
+    if (hardened) {
+        index |= 0x80000000;
+        data[0] = 0x00;
+        memcpy(data + 1, parent_key, 32);
+    } else {
+        // Calcular pubkey comprimida
+        uint8_t pubkey[33];
+        secp256k1_get_pubkey_compressed(parent_key, pubkey);
+        memcpy(data, pubkey, 33);
+    }
+    
+    data[33] = (index >> 24) & 0xFF;
+    data[34] = (index >> 16) & 0xFF;
+    data[35] = (index >> 8) & 0xFF;
+    data[36] = index & 0xFF;
+    
+    hmac_sha512(parent_chaincode, 32, data, hardened ? 37 : 37, I);
+    
+    // child_key = parse256(IL) + parent_key mod n
+    secp256k1_scalar_add(I, parent_key, child_key);
+    memcpy(child_chaincode, I + 32, 32);
+}
+
+// Derivar caminho completo: m/purpose'/0'/0'/0/0
+__device__ void derive_master_from_seed(
+    const uint8_t* seed,
+    uint8_t* master_key,
+    uint8_t* master_chaincode
+) {
+    uint8_t I[64];
+    const char* key_str = "Bitcoin seed";
+    hmac_sha512((const uint8_t*)key_str, 12, seed, 64, I);
+    memcpy(master_key, I, 32);
+    memcpy(master_chaincode, I + 32, 32);
+}
+
+__device__ void derive_path_from_master(
+    const uint8_t* master_key,
+    const uint8_t* master_chaincode,
+    uint32_t purpose, // 44 ou 84
+    uint8_t* private_key,
+    uint8_t* public_key_hash // RIPEMD160(SHA256(pubkey))
+) {
+    uint8_t key[32], chaincode[32];
+    uint8_t temp_key[32], temp_chaincode[32];
+
+    memcpy(key, master_key, 32);
+    memcpy(chaincode, master_chaincode, 32);
+
+    // m/purpose' (hardened)
+    derive_child_key(key, chaincode, purpose, temp_key, temp_chaincode, true);
+    memcpy(key, temp_key, 32);
+    memcpy(chaincode, temp_chaincode, 32);
+    
+    // m/purpose'/0' (hardened)
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true);
+    memcpy(key, temp_key, 32);
+    memcpy(chaincode, temp_chaincode, 32);
+    
+    // m/purpose'/0'/0' (hardened)
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true);
+    memcpy(key, temp_key, 32);
+    memcpy(chaincode, temp_chaincode, 32);
+    
+    // m/purpose'/0'/0'/0 (normal)
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, false);
+    memcpy(key, temp_key, 32);
+    memcpy(chaincode, temp_chaincode, 32);
+    
+    // m/purpose'/0'/0'/0/0 (normal)
+    derive_child_key(key, chaincode, 0, private_key, temp_chaincode, false);
+    
+    // Calcular public key hash
+    uint8_t pubkey[33];
+    secp256k1_get_pubkey_compressed(private_key, pubkey);
+    
+    uint8_t sha_hash[32];
+    sha256(pubkey, 33, sha_hash);
+    ripemd160(sha_hash, 32, public_key_hash);
+}
+
+__device__ void derive_path(
+    const uint8_t* seed,
+    uint32_t purpose, // 44 ou 84
+    uint8_t* private_key,
+    uint8_t* public_key_hash // RIPEMD160(SHA256(pubkey))
+) {
+    uint8_t master_key[32], master_chaincode[32];
+    uint8_t key[32], chaincode[32];
+    uint8_t temp_key[32], temp_chaincode[32];
+    
+    // Master key from seed
+    const char* key_str = "Bitcoin seed";
+    hmac_sha512((const uint8_t*)key_str, 12, seed, 64, master_key);
+    memcpy(master_chaincode, master_key + 32, 32);
+    
+    // m/purpose' (hardened)
+    derive_child_key(master_key, master_chaincode, purpose, key, chaincode, true);
+    
+    // m/purpose'/0' (hardened)
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true);
+    memcpy(key, temp_key, 32);
+    memcpy(chaincode, temp_chaincode, 32);
+    
+    // m/purpose'/0'/0' (hardened)
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true);
+    memcpy(key, temp_key, 32);
+    memcpy(chaincode, temp_chaincode, 32);
+    
+    // m/purpose'/0'/0'/0 (normal)
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, false);
+    memcpy(key, temp_key, 32);
+    memcpy(chaincode, temp_chaincode, 32);
+    
+    // m/purpose'/0'/0'/0/0 (normal)
+    derive_child_key(key, chaincode, 0, private_key, temp_chaincode, false);
+    
+    // Calcular public key hash
+    uint8_t pubkey[33];
+    secp256k1_get_pubkey_compressed(private_key, pubkey);
+    
+    uint8_t sha_hash[32];
+    sha256(pubkey, 33, sha_hash);
+    ripemd160(sha_hash, 32, public_key_hash);
+}
+
+// ============================================================================
+// Aritmética u128 para CUDA
+// ============================================================================
+__device__ __forceinline__ uint128_t make_u128(uint64_t lo, uint64_t hi) {
+    uint128_t r; r.lo = lo; r.hi = hi; return r;
+}
+
+__device__ __forceinline__ uint128_t u128_add(uint128_t a, uint64_t b) {
+    uint128_t r;
+    r.lo = a.lo + b;
+    r.hi = a.hi + (r.lo < a.lo ? 1 : 0);
+    return r;
+}
+
+__device__ __forceinline__ uint128_t u128_sub(uint128_t a, uint128_t b) {
+    uint128_t r;
+    r.lo = a.lo - b.lo;
+    r.hi = a.hi - b.hi - (a.lo < b.lo ? 1 : 0);
+    return r;
+}
+
+__device__ __forceinline__ bool u128_lt(uint128_t a, uint128_t b) {
+    return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo);
+}
+
+__device__ __forceinline__ uint64_t u128_div_u64(uint128_t* a, uint64_t b) {
+    // Divisão simplificada para caso hi == 0
+    if (a->hi == 0) {
+        uint64_t q = a->lo / b;
+        a->lo = a->lo % b;
+        return q;
+    }
+    // Para hi != 0, fazer divisão longa (simplificada)
+    __uint128_t val = ((__uint128_t)a->hi << 64) | a->lo;
+    uint64_t q = val / b;
+    uint64_t rem = val % b;
+    a->lo = rem;
+    a->hi = 0;
+    return q;
+}
+
+__device__ __forceinline__ uint64_t fnv1a64_dev(const uint8_t* data, int len, uint64_t seed) {
+    uint64_t hash = 1469598103934665603ULL ^ seed;
+    for (int i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+__device__ bool bloom_maybe_contains(const uint8_t* hash160) {
+    if (d_use_bloom == 0 || d_bloom_bits == nullptr || d_bloom_m_bits == 0 || d_bloom_k == 0) {
+        return false;
+    }
+    uint64_t h1 = fnv1a64_dev(hash160, 20, 0xA5A5A5A5A5A5A5A5ULL);
+    uint64_t h2 = fnv1a64_dev(hash160, 20, 0x5A5A5A5A5A5A5A5AULL);
+    for (uint32_t i = 0; i < d_bloom_k; i++) {
+        uint64_t combined = h1 + i * h2;
+        uint64_t bit_index = combined % d_bloom_m_bits;
+        uint64_t byte_index = bit_index >> 3;
+        uint8_t mask = 1u << (bit_index & 7u);
+        if ((d_bloom_bits[byte_index] & mask) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Converter K para permutação usando Lehmer/Factoradic
+// ============================================================================
+__device__ void k_to_permutation(uint128_t k, uint32_t n, uint8_t* perm) {
+    uint8_t available[24];
+    for (uint32_t i = 0; i < n; i++) available[i] = i;
+    
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t f = d_factorials[n - 1 - i];
+        uint64_t idx = u128_div_u64(&k, f);
+        
+        perm[i] = available[idx];
+        
+        // Remover elemento usado (shift)
+        for (uint32_t j = idx; j < n - 1 - i; j++) {
+            available[j] = available[j + 1];
+        }
+    }
+}
+
+// ============================================================================
+// Verificar checksum BIP39 para 24 palavras
+// ============================================================================
+__device__ bool verify_checksum_24(const uint16_t* idx) {
+    uint8_t entropy[32];
+    
+    uint64_t acc = 0;
+    for (int i = 0; i < 6; i++) acc = (acc << 11) | idx[i];
+    entropy[0]=(acc>>58); entropy[1]=(acc>>50); entropy[2]=(acc>>42); entropy[3]=(acc>>34);
+    entropy[4]=(acc>>26); entropy[5]=(acc>>18); entropy[6]=(acc>>10); entropy[7]=(acc>>2);
+    acc &= 3;
+    
+    for (int i = 6; i < 12; i++) acc = (acc << 11) | idx[i];
+    entropy[8]=(acc>>60); entropy[9]=(acc>>52); entropy[10]=(acc>>44); entropy[11]=(acc>>36);
+    entropy[12]=(acc>>28); entropy[13]=(acc>>20); entropy[14]=(acc>>12); entropy[15]=(acc>>4);
+    acc &= 15;
+    
+    for (int i = 12; i < 18; i++) acc = (acc << 11) | idx[i];
+    entropy[16]=(acc>>62); entropy[17]=(acc>>54); entropy[18]=(acc>>46); entropy[19]=(acc>>38);
+    entropy[20]=(acc>>30); entropy[21]=(acc>>22); entropy[22]=(acc>>14); entropy[23]=(acc>>6);
+    
+    __uint128_t big = acc & 63;
+    for (int i = 18; i < 24; i++) big = (big << 11) | idx[i];
+    entropy[24]=(big>>64); entropy[25]=(big>>56); entropy[26]=(big>>48); entropy[27]=(big>>40);
+    entropy[28]=(big>>32); entropy[29]=(big>>24); entropy[30]=(big>>16); entropy[31]=(big>>8);
+    
+    uint8_t checksum = big & 0xFF;
+    uint8_t hash[32];
+    sha256(entropy, 32, hash);
+    
+    return checksum == hash[0];
+}
+
+// ============================================================================
+// Kernel principal de busca v3 - Range Only + Shared Memory
+// ============================================================================
+__global__ void search_kernel_v2(
+    uint128_t range_start,
+    uint64_t batch_size,
+    uint64_t* valid_count,
+    uint64_t* tested_count
+) {
+    // Shared memory para fatoriais (cache local por bloco)
+    __shared__ uint64_t s_factorials[25];
+    __shared__ uint16_t s_base_indices[24];
+    __shared__ uint32_t s_word_count;
+    
+    // Primeiro thread do bloco carrega dados para shared memory
+    if (threadIdx.x == 0) {
+        s_word_count = d_word_count;
+        #pragma unroll
+        for (int i = 0; i < 25; i++) s_factorials[i] = d_factorials[i];
+        #pragma unroll
+        for (int i = 0; i < 24; i++) s_base_indices[i] = d_base_indices[i];
+    }
+    __syncthreads();
+    
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= batch_size) return;
+    
+    // Calcular K = range_start + tid
+    uint128_t k = u128_add(range_start, tid);
+    
+    // Converter K para permutação (usando shared memory)
+    uint8_t perm[24];
+    {
+        uint128_t temp = k;
+        uint8_t available[24];
+        #pragma unroll
+        for (int i = 0; i < 24; i++) available[i] = i;
+        
+        for (uint32_t i = 0; i < s_word_count; i++) {
+            uint32_t remaining = s_word_count - i;
+            uint64_t fact = s_factorials[remaining - 1];
+            uint64_t idx = temp.lo / fact;
+            temp.lo = temp.lo % fact;
+            
+            perm[i] = available[idx];
+            for (uint32_t j = idx; j < remaining - 1; j++) {
+                available[j] = available[j + 1];
+            }
+        }
+    }
+    
+    // Aplicar permutação aos índices base (usando shared memory)
+    uint16_t indices[24];
+    #pragma unroll
+    for (uint32_t i = 0; i < 24; i++) {
+        if (i < s_word_count) {
+            indices[i] = s_base_indices[perm[i]];
+        }
+    }
+    
+    // Verificar checksum BIP39
+    if (s_word_count == 24) {
+        if (!verify_checksum_24(indices)) {
+            return; // Checksum inválido, pular
+        }
+    }
+    
+    atomicAdd((unsigned long long*)valid_count, 1ULL);
+    
+    // Reconstruir frase mnemônica (otimizado: evitar strlen)
+    char mnemonic[256];
+    uint32_t mnemonic_len = 0;
+    
+    #pragma unroll 1
+    for (uint32_t i = 0; i < s_word_count; i++) {
+        if (i > 0) mnemonic[mnemonic_len++] = ' ';
+        const char* word = d_wordlist[indices[i]];
+        #pragma unroll 8
+        for (int c = 0; c < 8 && word[c]; c++) {
+            mnemonic[mnemonic_len++] = word[c];
+        }
+    }
+    mnemonic[mnemonic_len] = '\0';
+    
+    // Derivar seed via PBKDF2
+    uint8_t seed[64];
+    const char* salt = "mnemonic";
+    pbkdf2_sha512((const uint8_t*)mnemonic, mnemonic_len, (const uint8_t*)salt, 8, PBKDF2_ITERATIONS, seed, 64);
+    
+    // Master key/chaincode derivada uma vez por seed
+    uint8_t master_key[32];
+    uint8_t master_chaincode[32];
+    derive_master_from_seed(seed, master_key, master_chaincode);
+
+    uint8_t private_key[32];
+    uint8_t pubkey_hash[20];
+    
+    bool found = false;
+    uint8_t found_path = 0;
+
+    // Testar m/44'/0'/0'/0/0 (Legacy)
+    derive_path_from_master(master_key, master_chaincode, 44, private_key, pubkey_hash);
+
+    if (d_use_bloom) {
+        if (bloom_maybe_contains(pubkey_hash)) {
+            found = true;
+            found_path = 0;
+        }
+    } else {
+        for (uint32_t t = 0; t < d_num_targets; t++) {
+            bool match = true;
+            for (int j = 0; j < 20; j++) {
+                if (pubkey_hash[j] != d_target_hashes[t][j]) { match = false; break; }
+            }
+            if (match) {
+                found = true;
+                found_path = 0;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        // Testar m/84'/0'/0'/0/0 (SegWit)
+        derive_path_from_master(master_key, master_chaincode, 84, private_key, pubkey_hash);
+
+        if (d_use_bloom) {
+            if (bloom_maybe_contains(pubkey_hash)) {
+                found = true;
+                found_path = 1;
+            }
+        } else {
+            for (uint32_t t = 0; t < d_num_targets; t++) {
+                bool match = true;
+                for (int j = 0; j < 20; j++) {
+                    if (pubkey_hash[j] != d_target_hashes[t][j]) { match = false; break; }
+                }
+                if (match) {
+                    found = true;
+                    found_path = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (found) {
+        uint32_t slot = atomicAdd(&d_found_count, 1);
+        if (slot < 1024) {
+            d_found_results[slot].k_value = u128_add(range_start, tid);
+            memcpy(d_found_results[slot].private_key, private_key, 32);
+            d_found_results[slot].derivation_path = found_path;
+            for (uint32_t w = 0; w < d_word_count; w++) {
+                d_found_results[slot].mnemonic_indices[w*2] = indices[w] & 0xFF;
+                d_found_results[slot].mnemonic_indices[w*2+1] = (indices[w] >> 8) & 0xFF;
+            }
+        }
+        return;
+    }
+}
+
+// ============================================================================
+// Funções de host
+// ============================================================================
+
+void print_hex(const uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        printf("%02x", data[i]);
+    }
+}
+
+void print_u128(uint128_t v) {
+    if (v.hi == 0) {
+        printf("%llu", (unsigned long long)v.lo);
+    } else {
+        // Simplificado: mostrar como hex se muito grande
+        printf("0x%llx%016llx", (unsigned long long)v.hi, (unsigned long long)v.lo);
+    }
+}
+
+bool load_range_file(const char* filename, RangeHeader* header, uint16_t* base_indices, Range** ranges) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Erro ao abrir arquivo .range: %s\n", filename);
+        return false;
+    }
+    
+    if (fread(header, sizeof(RangeHeader), 1, f) != 1) {
+        fprintf(stderr, "Erro ao ler header\n");
+        fclose(f);
+        return false;
+    }
+    
+    if (header->magic != MAGIC_V2) {
+        fprintf(stderr, "Magic inválido (esperado 0x%08X, recebido 0x%08X)\n", MAGIC_V2, header->magic);
+        fclose(f);
+        return false;
+    }
+    
+    if (header->version != 2) {
+        fprintf(stderr, "Versão não suportada: %u\n", header->version);
+        fclose(f);
+        return false;
+    }
+    
+    // Ler base_indices
+    if (fread(base_indices, sizeof(uint16_t), header->word_count, f) != header->word_count) {
+        fprintf(stderr, "Erro ao ler base_indices\n");
+        fclose(f);
+        return false;
+    }
+    
+    // Ler ranges
+    *ranges = (Range*)malloc(header->num_ranges * sizeof(Range));
+    for (uint32_t i = 0; i < header->num_ranges; i++) {
+        if (fread(&(*ranges)[i].start, 16, 1, f) != 1 ||
+            fread(&(*ranges)[i].count, 16, 1, f) != 1) {
+            fprintf(stderr, "Erro ao ler range %u\n", i);
+            free(*ranges);
+            fclose(f);
+            return false;
+        }
+    }
+    
+    fclose(f);
+    return true;
+}
+
+bool load_addresses(const char* filename, uint8_t hashes[][20], uint32_t* count) {
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "Erro ao abrir arquivo de endereços: %s\n", filename);
+        return false;
+    }
+    
+    char line[256];
+    *count = 0;
+    
+    while (fgets(line, sizeof(line), f) && *count < MAX_ADDRESSES) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (strlen(line) == 0 || line[0] == '#') continue;
+        
+        if (strncmp(line, "bc1q", 4) == 0) {
+            if (bech32_decode_address(line, hashes[*count])) {
+                (*count)++;
+            }
+        } else if (line[0] == '1' || line[0] == '3') {
+            if (base58_decode_address(line, hashes[*count])) {
+                (*count)++;
+            }
+        }
+    }
+    
+    fclose(f);
+    printf("Endereços carregados: %u\n", *count);
+    return *count > 0;
+}
+
+bool load_wordlist(const char* filename, char wordlist[2048][9]) {
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "Arquivo wordlist não encontrado: %s\n", filename);
+        fprintf(stderr, "Baixe de: https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt\n");
+        return false;
+    }
+    
+    char line[64];
+    int count = 0;
+    
+    while (fgets(line, sizeof(line), f) && count < 2048) {
+        line[strcspn(line, "\r\n")] = 0;
+        strncpy(wordlist[count], line, 8);
+        wordlist[count][8] = '\0';
+        count++;
+    }
+    
+    fclose(f);
+    
+    if (count != 2048) {
+        fprintf(stderr, "Wordlist incompleta: %d palavras (esperado 2048)\n", count);
+        return false;
+    }
+    
+    return true;
+}
+
+#define BLOOM_MAGIC 0x424C4D46u
+#define BLOOM_VERSION 1u
+
+bool load_bloom(const char* filename, uint8_t** d_bits_out) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        return false;
+    }
+    
+    BloomHeader header;
+    if (fread(&header, sizeof(BloomHeader), 1, f) != 1) {
+        fclose(f);
+        return false;
+    }
+    
+    if (header.magic != BLOOM_MAGIC || header.version != BLOOM_VERSION) {
+        fclose(f);
+        return false;
+    }
+    
+    uint64_t num_bytes = (header.m_bits + 7ULL) / 8ULL;
+    uint8_t* host_bits = (uint8_t*)malloc((size_t)num_bytes);
+    if (!host_bits) {
+        fclose(f);
+        fprintf(stderr, "Erro ao alocar memória para Bloom filter (host)\n");
+        return false;
+    }
+    
+    if (fread(host_bits, 1, (size_t)num_bytes, f) != num_bytes) {
+        fclose(f);
+        free(host_bits);
+        fprintf(stderr, "Erro ao ler dados do Bloom filter\n");
+        return false;
+    }
+    
+    fclose(f);
+    
+    uint8_t* device_bits = NULL;
+    cudaError_t err = cudaMalloc(&device_bits, num_bytes);
+    if (err != cudaSuccess) {
+        free(host_bits);
+        fprintf(stderr, "cudaMalloc para Bloom filter falhou: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    
+    err = cudaMemcpy(device_bits, host_bits, num_bytes, cudaMemcpyHostToDevice);
+    free(host_bits);
+    if (err != cudaSuccess) {
+        cudaFree(device_bits);
+        fprintf(stderr, "cudaMemcpy para Bloom filter falhou: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    
+    cudaMemcpyToSymbol(d_bloom_m_bits, &header.m_bits, sizeof(uint64_t));
+    cudaMemcpyToSymbol(d_bloom_k, &header.k, sizeof(uint32_t));
+    cudaMemcpyToSymbol(d_bloom_bits, &device_bits, sizeof(uint8_t*));
+    uint32_t use_bloom = 1u;
+    cudaMemcpyToSymbol(d_use_bloom, &use_bloom, sizeof(uint32_t));
+    
+    printf("Bloom filter carregado: %llu bits, k=%u, itens=%llu\n",
+           (unsigned long long)header.m_bits,
+           header.k,
+           (unsigned long long)header.n_items);
+    
+    *d_bits_out = device_bits;
+    return true;
+}
+
+void compute_factorials(uint64_t* fact) {
+    fact[0] = 1;
+    for (int i = 1; i <= 24; i++) {
+        fact[i] = fact[i-1] * i;
+    }
+}
+
+// ============================================================================
+// Função de processamento por GPU (executada em thread separada)
+// ============================================================================
+void gpu_worker(
+    int device_id,
+    int num_gpus,
+    const RangeHeader& header,
+    Range* ranges,
+    char h_wordlist[2048][9],
+    uint16_t* h_base_indices,
+    uint64_t* h_factorials,
+    uint8_t* h_target_hashes,
+    uint32_t num_targets,
+    bool use_bloom,
+    const char* bloom_file
+) {
+    cudaSetDevice(device_id);
+    
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device_id);
+    
+    {
+        std::lock_guard<std::mutex> lock(g_print_mutex);
+        printf("GPU %d (%s): Iniciando...\n", device_id, prop.name);
+    }
+    
+    // Copiar constantes para esta GPU
+    cudaMemcpyToSymbol(d_wordlist, h_wordlist, sizeof(char) * 2048 * 9);
+    cudaMemcpyToSymbol(d_base_indices, h_base_indices, header.word_count * sizeof(uint16_t));
+    cudaMemcpyToSymbol(d_word_count, &header.word_count, sizeof(uint32_t));
+    cudaMemcpyToSymbol(d_factorials, h_factorials, sizeof(uint64_t) * 25);
+    
+    uint8_t* d_bloom_bits_ptr = nullptr;
+    
+    if (use_bloom) {
+        load_bloom(bloom_file, &d_bloom_bits_ptr);
+    } else {
+        cudaMemcpyToSymbol(d_target_hashes, h_target_hashes, num_targets * 20);
+        cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(uint32_t));
+    }
+    
+    // Criar streams para esta GPU
+    cudaStream_t streams[NUM_STREAMS];
+    uint64_t* d_valid_count[NUM_STREAMS];
+    uint64_t* d_tested_count[NUM_STREAMS];
+    
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        cudaStreamCreate(&streams[s]);
+        cudaMalloc(&d_valid_count[s], sizeof(uint64_t));
+        cudaMalloc(&d_tested_count[s], sizeof(uint64_t));
+    }
+    
+    // Reset contador de encontrados
+    uint32_t zero32 = 0;
+    cudaMemcpyToSymbol(d_found_count, &zero32, sizeof(uint32_t));
+    
+    uint64_t batch_size = (uint64_t)g_batch_size_millions * 1024ULL * 1024ULL;
+    
+    // Dividir ranges entre GPUs
+    for (uint32_t r = 0; r < header.num_ranges; r++) {
+        uint128_t range_start = ranges[r].start;
+        uint64_t range_total = ranges[r].count.lo;
+        
+        // Cada GPU processa uma fatia do range
+        uint64_t gpu_chunk = range_total / num_gpus;
+        uint64_t gpu_start_offset = (uint64_t)device_id * gpu_chunk;
+        uint64_t gpu_end_offset = (device_id == num_gpus - 1) ? range_total : gpu_start_offset + gpu_chunk;
+        
+        uint128_t current = u128_add(range_start, gpu_start_offset);
+        uint64_t remaining = gpu_end_offset - gpu_start_offset;
+        
+        int stream_idx = 0;
+        
+        while (remaining > 0) {
+            uint64_t this_batch = (remaining < batch_size) ? remaining : batch_size;
+            uint32_t grid_size = (this_batch + g_threads_per_block - 1) / g_threads_per_block;
+            
+            // Reset contador de válidos
+            uint64_t zero64 = 0;
+            cudaMemcpyAsync(d_valid_count[stream_idx], &zero64, sizeof(uint64_t), 
+                           cudaMemcpyHostToDevice, streams[stream_idx]);
+            
+            // Lançar kernel no stream atual
+            search_kernel_v2<<<grid_size, g_threads_per_block, 0, streams[stream_idx]>>>(
+                current,
+                this_batch,
+                d_valid_count[stream_idx],
+                d_tested_count[stream_idx]
+            );
+            
+            // Avançar para próximo stream (round-robin)
+            stream_idx = (stream_idx + 1) % NUM_STREAMS;
+            
+            // A cada N batches, sincronizar e atualizar contadores
+            if (stream_idx == 0) {
+                cudaDeviceSynchronize();
+                
+                uint64_t batch_valid = 0;
+                for (int s = 0; s < NUM_STREAMS; s++) {
+                    uint64_t sv;
+                    cudaMemcpy(&sv, d_valid_count[s], sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                    batch_valid += sv;
+                }
+                
+                g_total_processed += this_batch * NUM_STREAMS;
+                g_total_valid += batch_valid;
+                
+                // Verificar se encontrou algo
+                uint32_t found_count;
+                cudaMemcpyFromSymbol(&found_count, d_found_count, sizeof(uint32_t));
+                
+                if (found_count > g_total_found) {
+                    g_total_found = found_count;
+                    
+                    std::lock_guard<std::mutex> lock(g_print_mutex);
+                    printf("\n[GPU %d] ENCONTROU %u resultados!\n", device_id, found_count);
+                    
+                    // Salvar resultados
+                    FoundResult h_results[1024];
+                    cudaMemcpyFromSymbol(h_results, d_found_results, sizeof(FoundResult) * std::min(found_count, 1024u));
+                    
+                    std::lock_guard<std::mutex> flock(g_file_mutex);
+                    FILE* f = fopen("FOUND.txt", "a");
+                    if (f) {
+                        for (uint32_t i = 0; i < std::min(found_count, 1024u); i++) {
+                            fprintf(f, "GPU: %d\n", device_id);
+                            fprintf(f, "K: %llu\n", (unsigned long long)h_results[i].k_value.lo);
+                            fprintf(f, "Path: m/%s'/0'/0'/0/0\n",
+                                    h_results[i].derivation_path == 0 ? "44" : "84");
+                            fprintf(f, "Private Key: ");
+                            for (int j = 0; j < 32; j++) {
+                                fprintf(f, "%02x", h_results[i].private_key[j]);
+                            }
+                            fprintf(f, "\nMnemonic: ");
+                            for (uint32_t w = 0; w < header.word_count; w++) {
+                                uint16_t idx = h_results[i].mnemonic_indices[w * 2] | 
+                                               (h_results[i].mnemonic_indices[w * 2 + 1] << 8);
+                                fprintf(f, "%s ", h_wordlist[idx]);
+                            }
+                            fprintf(f, "\n\n");
+                        }
+                        fclose(f);
+                    }
+                }
+            }
+            
+            current = u128_add(current, this_batch);
+            remaining -= this_batch;
+        }
+    }
+    
+    // Sincronizar streams finais
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        cudaStreamSynchronize(streams[s]);
+        cudaFree(d_valid_count[s]);
+        cudaFree(d_tested_count[s]);
+        cudaStreamDestroy(streams[s]);
+    }
+    
+    if (d_bloom_bits_ptr) cudaFree(d_bloom_bits_ptr);
+    
+    {
+        std::lock_guard<std::mutex> lock(g_print_mutex);
+        printf("GPU %d: Finalizado.\n", device_id);
+    }
+}
+
+int main(int argc, char** argv) {
+    printf("============================================================\n");
+    printf("  BIP39 CUDA Scanner v3.0 - Multi-GPU + Streams\n");
+    printf("============================================================\n");
+    
+    if (argc < 3) {
+        printf("Uso: %s <job.range> <addresses.txt|bloom.bin> [wordlist.txt] [threads] [batch_mb] [num_gpus]\n", argv[0]);
+        printf("\n");
+        printf("  job.range     - Arquivo .range gerado pelo rust-generator\n");
+        printf("  addresses.txt - Lista de endereços alvo (um por linha)\n");
+        printf("  bloom.bin     - Bloom filter gerado por build_bloom (opcional)\n");
+        printf("  wordlist.txt  - Lista de palavras BIP39 (opcional, default: wordlist.txt)\n");
+        printf("  threads       - Threads por bloco (opcional, default: 256)\n");
+        printf("  batch_mb      - Tamanho do batch em milhões (opcional, default: 4)\n");
+        printf("  num_gpus      - Número de GPUs a usar (opcional, default: todas)\n");
+        return 1;
+    }
+    
+    const char* range_file = argv[1];
+    const char* addresses_file = argv[2];
+    const char* wordlist_file = argc > 3 ? argv[3] : "wordlist.txt";
+    if (argc > 4) g_threads_per_block = (uint32_t)atoi(argv[4]);
+    if (argc > 5) g_batch_size_millions = (uint32_t)atoi(argv[5]);
+    
+    if (g_threads_per_block < 32) g_threads_per_block = 32;
+    if (g_threads_per_block > 1024) g_threads_per_block = 1024;
+    if (g_batch_size_millions < 1) g_batch_size_millions = 1;
+    if (g_batch_size_millions > 100) g_batch_size_millions = 100;
+    
+    // Verificar GPUs disponíveis
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    printf("GPUs disponíveis: %d\n", device_count);
+    
+    if (device_count == 0) {
+        fprintf(stderr, "Nenhuma GPU CUDA encontrada!\n");
+        return 1;
+    }
+    
+    int num_gpus_to_use = device_count;
+    if (argc > 6) {
+        num_gpus_to_use = std::min(atoi(argv[6]), device_count);
+        if (num_gpus_to_use < 1) num_gpus_to_use = 1;
+    }
+    
+    printf("Usando %d GPU(s) com %d streams cada\n", num_gpus_to_use, NUM_STREAMS);
+    
+    for (int i = 0; i < device_count; i++) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, i);
+        printf("  #%d: %s (%.1f GB, %d MPs, CC %d.%d)%s\n", 
+               i, prop.name, 
+               prop.totalGlobalMem / 1e9,
+               prop.multiProcessorCount,
+               prop.major, prop.minor,
+               i < num_gpus_to_use ? " [ATIVO]" : "");
+    }
+    
+    // Carregar wordlist
+    char h_wordlist[2048][9];
+    if (!load_wordlist(wordlist_file, h_wordlist)) {
+        return 1;
+    }
+    
+    // Verificar se é bloom ou addresses
+    bool use_bloom = false;
+    uint8_t (*h_target_hashes)[20] = nullptr;
+    uint32_t num_targets = 0;
+    
+    FILE* test_bloom = fopen(addresses_file, "rb");
+    if (test_bloom) {
+        BloomHeader bh;
+        if (fread(&bh, sizeof(BloomHeader), 1, test_bloom) == 1 && bh.magic == 0x424C4F4D) {
+            use_bloom = true;
+            printf("\nUsando Bloom filter: %s\n", addresses_file);
+        }
+        fclose(test_bloom);
+    }
+    
+    if (!use_bloom) {
+        h_target_hashes = new uint8_t[MAX_ADDRESSES][20];
+        if (!load_addresses(addresses_file, h_target_hashes, &num_targets)) {
+            delete[] h_target_hashes;
+            return 1;
+        }
+        printf("\nCarregados %u endereços alvo\n", num_targets);
+    }
+    
+    // Carregar arquivo .range
+    RangeHeader header;
+    uint16_t h_base_indices[24];
+    Range* ranges;
+    if (!load_range_file(range_file, &header, h_base_indices, &ranges)) {
+        if (h_target_hashes) delete[] h_target_hashes;
+        return 1;
+    }
+    
+    printf("\nArquivo .range carregado:\n");
+    printf("  Palavras: %u\n", header.word_count);
+    printf("  Ranges: %u\n", header.num_ranges);
+    printf("  Palavras base: ");
+    for (uint32_t i = 0; i < header.word_count; i++) {
+        printf("%s ", h_wordlist[h_base_indices[i]]);
+    }
+    printf("\n");
+    
+    // Calcular fatoriais
+    uint64_t h_factorials[25];
+    compute_factorials(h_factorials);
+    
+    printf("\n============================================================\n");
+    printf("Config: %u threads/bloco, %u M/batch, %d streams/GPU\n", 
+           g_threads_per_block, g_batch_size_millions, NUM_STREAMS);
+    printf("Iniciando busca Multi-GPU...\n");
+    printf("============================================================\n");
+    
+    clock_t start_time = clock();
+    
+    // Lançar threads para cada GPU
+    std::vector<std::thread> gpu_threads;
+    
+    for (int gpu = 0; gpu < num_gpus_to_use; gpu++) {
+        gpu_threads.emplace_back(
+            gpu_worker,
+            gpu,
+            num_gpus_to_use,
+            std::ref(header),
+            ranges,
+            h_wordlist,
+            h_base_indices,
+            h_factorials,
+            (uint8_t*)h_target_hashes,
+            num_targets,
+            use_bloom,
+            addresses_file
+        );
+    }
+    
+    // Thread de monitoramento de progresso
+    std::thread monitor_thread([&]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            
+            uint64_t processed = g_total_processed.load();
+            uint64_t valid = g_total_valid.load();
+            uint32_t found = g_total_found.load();
+            
+            double elapsed = (double)(clock() - start_time) / CLOCKS_PER_SEC;
+            if (elapsed < 0.1) continue;
+            
+            double rate = processed / elapsed;
+            
+            printf("\r[%d GPUs] %.2f M/s | Testados: %llu | Válidos: %llu | Encontrados: %u    ",
+                   num_gpus_to_use,
+                   rate / 1e6,
+                   (unsigned long long)processed,
+                   (unsigned long long)valid,
+                   found);
+            fflush(stdout);
+            
+            // Verificar se todas as threads terminaram
+            bool all_done = true;
+            for (auto& t : gpu_threads) {
+                if (t.joinable()) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) break;
+        }
+    });
+    
+    // Aguardar todas as GPUs terminarem
+    for (auto& t : gpu_threads) {
+        if (t.joinable()) t.join();
+    }
+    
+    // Parar thread de monitoramento
+    monitor_thread.detach();
+    
+    double total_time = (double)(clock() - start_time) / CLOCKS_PER_SEC;
+    
+    printf("\n\n============================================================\n");
+    printf("  CONCLUÍDO - Multi-GPU\n");
+    printf("============================================================\n");
+    printf("GPUs utilizadas: %d\n", num_gpus_to_use);
+    printf("Streams por GPU: %d\n", NUM_STREAMS);
+    printf("Total de Ks testados: %llu\n", (unsigned long long)g_total_processed.load());
+    printf("Frases válidas (checksum OK): %llu\n", (unsigned long long)g_total_valid.load());
+    printf("Resultados encontrados: %u\n", g_total_found.load());
+    printf("Tempo total: %.2f segundos\n", total_time);
+    printf("Taxa média: %.2f M/s\n", g_total_processed.load() / total_time / 1e6);
+    printf("Taxa por GPU: %.2f M/s\n", g_total_processed.load() / total_time / 1e6 / num_gpus_to_use);
+    printf("============================================================\n");
+    
+    // Cleanup
+    if (h_target_hashes) delete[] h_target_hashes;
+    free(ranges);
+    
+    return 0;
+}
