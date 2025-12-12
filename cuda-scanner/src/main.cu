@@ -1034,30 +1034,38 @@ void temp_k_to_mnemonic(uint128_t k, uint32_t amount, char words[24][10],
     
     uint8_t perm[24];
     uint8_t available[24];
-    for(int i=0; i<24; i++) available[i] = i;
+    for(int i=0; i<(int)amount; i++) available[i] = i;
 
-    uint128_t temp = k;
+    // For large word counts (>20), we can't use factorial properly in 64-bit.
+    // Use a simpler approach: just shuffle based on k.lo value directly.
+    // This won't give exact permutation but will show changing phrases.
     
-    for (uint32_t i = 0; i < amount; i++) {
-        uint32_t remaining = amount - i;
-        uint64_t fact = facts[remaining - 1]; 
-        
-        // Simple division for visualization (assumes k < 2^64 for fact < 2^64 segments)
-        // For full correctness with uint128_t > 64bit, we need 128-bit div.
-        // Since this is just for display "current phrase", approximation or lower bits is fine if just cycling.
-        // But let's try to be somewhat correct using host 128-bit if available.
-#ifdef __GNUC__
-        unsigned __int128 val = ((unsigned __int128)temp.hi << 64) | temp.lo;
-        uint64_t idx = (uint64_t)(val / fact);
-        temp.lo = (uint64_t)(val % fact);
-        temp.hi = 0; 
-#else
-        uint64_t idx = temp.lo / fact;
-        temp.lo %= fact;
-#endif  
-        perm[i] = available[idx];
-        for (uint32_t j = idx; j < remaining - 1; j++) {
-            available[j] = available[j + 1];
+    if (amount > 20) {
+        // Simplified shuffle for display purposes
+        uint64_t seed = k.lo;
+        for (uint32_t i = 0; i < amount; i++) {
+            uint32_t remaining = amount - i;
+            uint64_t idx = seed % remaining;
+            seed = seed / remaining + (seed % remaining) * 1103515245 + 12345; // LCG for variation
+            
+            perm[i] = available[idx];
+            for (uint32_t j = idx; j < remaining - 1; j++) {
+                available[j] = available[j + 1];
+            }
+        }
+    } else {
+        // Original logic for <= 20 words
+        uint64_t temp_k = k.lo;
+        for (uint32_t i = 0; i < amount; i++) {
+            uint32_t remaining = amount - i;
+            uint64_t fact = facts[remaining - 1]; 
+            uint64_t idx = temp_k / fact;
+            temp_k = temp_k % fact;
+            
+            perm[i] = available[idx];
+            for (uint32_t j = idx; j < remaining - 1; j++) {
+                available[j] = available[j + 1];
+            }
         }
     }
 
