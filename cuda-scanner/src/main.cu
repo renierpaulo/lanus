@@ -608,13 +608,12 @@ __global__ void search_kernel_v2(
     bool found = false;
     uint8_t found_path = 0;
 
-    // Testar m/44'/0'/0'/0/0 (Legacy)
+    // Testar APENAS m/44'/0'/0'/0/0 (Legacy)
     derive_path_from_master(master_key, master_chaincode, 44, private_key, pubkey_hash);
 
     if (d_use_bloom) {
         if (bloom_maybe_contains(pubkey_hash)) {
             found = true;
-            found_path = 0;
         }
     } else {
         for (uint32_t t = 0; t < d_num_targets; t++) {
@@ -624,60 +623,7 @@ __global__ void search_kernel_v2(
             }
             if (match) {
                 found = true;
-                found_path = 0;
                 break;
-            }
-        }
-    }
-
-    if (!found) {
-        // Testar m/84'/0'/0'/0/0 (SegWit)
-        derive_path_from_master(master_key, master_chaincode, 84, private_key, pubkey_hash);
-
-        if (d_use_bloom) {
-            if (bloom_maybe_contains(pubkey_hash)) {
-                found = true;
-                found_path = 1;
-            }
-        } else {
-            for (uint32_t t = 0; t < d_num_targets; t++) {
-                bool match = true;
-                for (int j = 0; j < 20; j++) {
-                    if (pubkey_hash[j] != d_target_hashes_ptr[t * 20 + j]) { match = false; break; }
-                }
-                if (match) {
-                    found = true;
-                    found_path = 1;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!found) {
-        // Testar m/49'/0'/0'/0/0 (P2SH-Segwit)
-        derive_path_from_master(master_key, master_chaincode, 49, private_key, pubkey_hash);
-        
-        // Converter KeyHash para ScriptHash (for P2SH addresses)
-        uint8_t script_hash[20];
-        keyhash_to_p2sh_p2wpkh(pubkey_hash, script_hash);
-
-        if (d_use_bloom) {
-            if (bloom_maybe_contains(script_hash)) {
-                found = true;
-                found_path = 2; // 2 = m/49'
-            }
-        } else {
-            for (uint32_t t = 0; t < d_num_targets; t++) {
-                bool match = true;
-                for (int j = 0; j < 20; j++) {
-                    if (script_hash[j] != d_target_hashes_ptr[t * 20 + j]) { match = false; break; }
-                }
-                if (match) {
-                    found = true;
-                    found_path = 2;
-                    break;
-                }
             }
         }
     }
@@ -687,7 +633,7 @@ __global__ void search_kernel_v2(
         if (slot < 1024) {
             d_found_results[slot].k_value = u128_add(range_start, tid);
             memcpy(d_found_results[slot].private_key, private_key, 32);
-            d_found_results[slot].derivation_path = found_path;
+            d_found_results[slot].derivation_path = 0; // Always m/44'
             for (uint32_t w = 0; w < d_word_count; w++) {
                 d_found_results[slot].mnemonic_indices[w*2] = indices[w] & 0xFF;
                 d_found_results[slot].mnemonic_indices[w*2+1] = (indices[w] >> 8) & 0xFF;
@@ -1334,7 +1280,7 @@ int main(int argc, char** argv) {
     }
 
     while(true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         
         uint64_t processed = g_total_processed.load();
         uint32_t found = g_total_found.load();
@@ -1345,14 +1291,41 @@ int main(int argc, char** argv) {
         uint128_t current_k = u128_add(ranges_ptr[0].start, processed);
         temp_k_to_mnemonic(current_k, word_count_job, cur_words, h_wordlist, h_base_indices, facts);
 
-        printf("\r\033[K"); 
-        printf("Speed: %.2f M/s | Found: %d | Path: Scan | Current: ", rate/1000000.0, found);
-        for(uint32_t w=0; w<word_count_job; w++) printf("%s ", cur_words[w]);
+        // Build mnemonic string
+        char mnemonic_str[256] = "";
+        for(uint32_t w=0; w<word_count_job && w < 12; w++) {
+            strcat(mnemonic_str, cur_words[w]);
+            if(w < word_count_job - 1) strcat(mnemonic_str, " ");
+        }
+
+        // Clear screen and show fixed layout
+        printf("\033[2J\033[H"); // Clear screen and move cursor to top
+        printf("============================================================\n");
+        printf("  LANUS BIP39 SCANNER v4.0 - RTX 5090 TURBO\n");
+        printf("============================================================\n");
+        printf("Using derivation path: m/44'/0'/0'/0/0\n");
+        printf("Running on %d GPU(s)\n", gpu_n);
+        printf("------------------------------------------------------------\n");
+        printf("Speed:      %.2f M/s\n", rate/1000000.0);
+        printf("Tested:     %llu\n", (unsigned long long)processed);
+        printf("Found:      %u\n", found);
+        printf("Elapsed:    %.1f s\n", elapsed);
+        printf("------------------------------------------------------------\n");
+        printf("Current Mnemonic: %s\n", mnemonic_str);
+        printf("Path:             m/44'/0'/0'/0/0\n");
+        printf("------------------------------------------------------------\n");
+        
+        if (found > 0) {
+            printf("\n*** MATCH FOUND! Check FOUND.txt ***\n");
+        }
+
         fflush(stdout);
 
         // Check for completion based on progress
         if (processed >= ranges_ptr[0].count.lo && ranges_ptr[0].count.hi == 0) {
-             printf("\nExploração concluída.\n");
+             printf("\n============================================================\n");
+             printf("  SCAN COMPLETE\n");
+             printf("============================================================\n");
              break;
         }
     }
