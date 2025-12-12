@@ -55,6 +55,18 @@ void send_telegram_alert(const char* message) {
 #define HOST_BATCH_SIZE 100000 
 // Enough to feed GPU without too much latency. 
 
+// Estruturas Globais para fila
+#include <queue>
+#include <condition_variable>
+
+std::queue<std::vector<uint16_t>> g_batch_queue;
+std::mutex g_batch_mutex;
+std::condition_variable g_batch_cv;
+bool g_producer_done = false;
+
+// Forward decl
+void cpu_producer(uint16_t* base_indices, uint32_t word_count, uint64_t max_permutations);
+void gpu_worker_consumer(int device_id, int num_gpus, RangeHeader& header, char h_wordlist[2048][9], uint16_t* base_indices, const uint8_t* h_target_hashes, uint32_t num_targets, bool use_bloom);
 
 // Variáveis globais para multi-threading
 std::atomic<uint64_t> g_total_processed(0);
@@ -352,22 +364,7 @@ __device__ void keyhash_to_p2sh_p2wpkh(const uint8_t* keyhash, uint8_t* scriptha
 // Aritmética u128 para CUDA
 // ============================================================================
 __host__ __device__ __forceinline__ uint128_t make_u128(uint64_t lo, uint64_t hi) {
-    uint128_t r; r.lo = lo; r.hi = hi;
-// Estruturas Globais para fila
-#include <queue>
-#include <condition_variable>
-
-std::queue<std::vector<uint16_t>> g_batch_queue;
-std::mutex g_batch_mutex;
-std::condition_variable g_batch_cv;
-bool g_producer_done = false;
-
-// Forward decl
-void cpu_producer(uint16_t* base_indices, uint32_t word_count, uint64_t max_permutations);
-void gpu_worker_consumer(int device_id, int num_gpus, RangeHeader& header, char h_wordlist[2048][9], uint16_t* base_indices, const uint8_t* h_target_hashes, uint32_t num_targets, bool use_bloom);
-
-
-return r;
+    uint128_t r; r.lo = lo; r.hi = hi; return r;
 }
 
 __host__ __device__ __forceinline__ uint128_t u128_add(uint128_t a, uint64_t b) {
