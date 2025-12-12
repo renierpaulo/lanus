@@ -1,27 +1,38 @@
 # Makefile para BIP39 CUDA Scanner
-# Requer CUDA Toolkit instalado
-
-# Configuração de Arquitetura (__sm_90__ para RTX 5090/Blackwell, __sm_89__ para RTX 4090)
-# Se der erro de arquitetura desconhecida, tente sm_86 ou sm_75
-ARCH = sm_90
+# Detecta automaticamente o sistema operacional para comandos básicos
 
 NVCC = nvcc
-NVCC_FLAGS = -O3 -arch=$(ARCH) --use_fast_math -Xcompiler "/O2"
+# Ajuste a arquitetura conforme necessário (sm_89 = RTX 4090, sm_90 = H100/Blackwell)
+ARCH = sm_89
+NVCC_FLAGS = -O3 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3"
 
 SRC_DIR = src
 BUILD_DIR = build
-TARGET = bip39_scanner.exe
+TARGET_NAME = bip39_scanner
+
+# Configuração condicional de comandos
+ifeq ($(OS),Windows_NT)
+    # Windows
+    TARGET = $(TARGET_NAME).exe
+    MKDIR_CMD = if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
+    # Cleaning on Windows cmd is tricky in make, simpler to assume rm exists (git bash) or use rmdir
+    CLEAN_CMD = if exist $(BUILD_DIR) rmdir /s /q $(BUILD_DIR)
+else
+    # Linux / Unix
+    TARGET = $(TARGET_NAME)
+    MKDIR_CMD = mkdir -p $(BUILD_DIR)
+    CLEAN_CMD = rm -rf $(BUILD_DIR)
+endif
 
 SOURCES = $(SRC_DIR)/main.cu
 
-.PHONY: all clean windows
+.PHONY: all clean
 
-all: windows
+all: $(BUILD_DIR)/$(TARGET)
 
-# Alvo principal para Windows
-windows:
-	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
-	$(NVCC) $(NVCC_FLAGS) -o $(BUILD_DIR)\$(TARGET) $(SOURCES)
+$(BUILD_DIR)/$(TARGET): $(SOURCES)
+	@$(MKDIR_CMD)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(SOURCES)
 
 clean:
-	@if exist $(BUILD_DIR) rmdir /s /q $(BUILD_DIR)
+	@$(CLEAN_CMD)
