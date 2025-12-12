@@ -113,6 +113,15 @@ __constant__ uint32_t d_use_bloom = 0;
 __device__ FoundResult d_found_results[1024];
 __device__ uint32_t d_found_count = 0;
 
+// Last valid phrase info for display
+struct LastValidInfo {
+    uint16_t indices[24];
+    uint8_t private_key[32];
+    uint8_t pubkey_hash[20];
+    uint32_t word_count;
+};
+__device__ LastValidInfo d_last_valid;
+
 // ============================================================================
 // PBKDF2-SHA512 para derivação de seed
 // ============================================================================
@@ -609,6 +618,14 @@ __global__ void search_kernel_v2(
 
     // Testar APENAS m/44'/0'/0'/0/0 (Legacy)
     derive_path_from_master(master_key, master_chaincode, 44, private_key, pubkey_hash);
+
+    // Store last valid info for display (no sync needed, just visual feedback)
+    if (tid == 0 || (tid % 10000) == 0) {
+        for(uint32_t w = 0; w < d_word_count; w++) d_last_valid.indices[w] = indices[w];
+        memcpy(d_last_valid.private_key, private_key, 32);
+        memcpy(d_last_valid.pubkey_hash, pubkey_hash, 20);
+        d_last_valid.word_count = d_word_count;
+    }
 
     if (d_use_bloom) {
         if (bloom_maybe_contains(pubkey_hash)) {
@@ -1293,25 +1310,36 @@ int main(int argc, char** argv) {
         uint32_t found = g_total_found.load();
         double elapsed = (double)(clock() - start_time) / CLOCKS_PER_SEC;
         double rate = elapsed > 0 ? processed/elapsed : 0;
-        
-        char cur_words[24][10];
-        uint128_t current_k = u128_add(ranges_ptr[0].start, processed);
-        temp_k_to_mnemonic(current_k, word_count_job, cur_words, h_wordlist, h_base_indices, facts);
 
-        // Build mnemonic string
-        char mnemonic_str[256] = "";
-        for(uint32_t w=0; w<word_count_job && w < 12; w++) {
-            strcat(mnemonic_str, cur_words[w]);
-            if(w < word_count_job - 1) strcat(mnemonic_str, " ");
+        // Get last valid info from GPU
+        LastValidInfo h_last_valid;
+        cudaMemcpyFromSymbol(&h_last_valid, d_last_valid, sizeof(LastValidInfo));
+
+        // Build mnemonic string from real indices
+        char mnemonic_str[300] = "";
+        for(uint32_t w=0; w < h_last_valid.word_count && w < 12; w++) {
+            if(w > 0) strcat(mnemonic_str, " ");
+            strcat(mnemonic_str, h_wordlist[h_last_valid.indices[w]]);
         }
 
-        // Generate a sample private key for display (simplified - just for visual feedback)
-        // Real private keys are only saved when found
+        // Build private key hex
         char privkey_hex[65] = "";
-        uint64_t pk_seed = processed ^ 0xDEADBEEF;
         for(int i=0; i<32; i++) {
-            pk_seed = pk_seed * 1103515245 + 12345;
-            sprintf(privkey_hex + i*2, "%02x", (uint8_t)(pk_seed >> 24));
+            sprintf(privkey_hex + i*2, "%02x", h_last_valid.private_key[i]);
+        }
+
+        // Build address from pubkey_hash (P2PKH format)
+        char address[64] = "";
+        {
+            uint8_t addr_bytes[25];
+            addr_bytes[0] = 0x00; // mainnet P2PKH
+            memcpy(addr_bytes + 1, h_last_valid.pubkey_hash, 20);
+            // Checksum
+            uint8_t sha1[32], sha2[32];
+            sha256(addr_bytes, 21, sha1);
+            sha256(sha1, 32, sha2);
+            memcpy(addr_bytes + 21, sha2, 4);
+            base58_encode(addr_bytes, 25, address);
         }
 
         uint64_t valid = g_total_valid.load();
@@ -1324,15 +1352,16 @@ int main(int argc, char** argv) {
         printf("Using derivation path: m/44'/0'/0'/0/0\n");
         printf("Running on %d GPU(s) | Batch: %u M | Threads: %u\n", gpu_n, g_batch_size_millions, g_threads_per_block);
         printf("------------------------------------------------------------\n");
-        printf("Speed:       %.2f M/s (permutations)\n", rate/1000000.0);
-        printf("Tested:      %llu\n", (unsigned long long)processed);
+        printf("Speed:       %.2f M/s (valid phrases/s)\n", valid > 0 ? (valid/elapsed)/1000000.0 : 0);
+        printf("Tested:      %llu permutations\n", (unsigned long long)processed);
         printf("Valid (CS):  %llu (%.2f%%)\n", (unsigned long long)valid, processed > 0 ? (valid*100.0/processed) : 0);
         printf("Found:       %u\n", found);
         printf("Elapsed:     %.1f s\n", elapsed);
         printf("------------------------------------------------------------\n");
-        printf("Current Mnemonic: %s\n", mnemonic_str);
-        printf("Sample PrivKey:   %s\n", privkey_hex);
-        printf("Path:             m/44'/0'/0'/0/0\n");
+        printf("Last Valid Mnemonic: %s\n", mnemonic_str);
+        printf("Address:             %s\n", address);
+        printf("Private Key:         %s\n", privkey_hex);
+        printf("Path:                m/44'/0'/0'/0/0\n");
         printf("------------------------------------------------------------\n");
         
         if (found > 0) {
