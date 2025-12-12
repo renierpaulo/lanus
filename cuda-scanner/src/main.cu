@@ -45,6 +45,18 @@ std::atomic<uint64_t> g_addresses_checked(0);
 std::atomic<uint32_t> g_found(0);
 std::mutex g_print_mutex;
 
+// Sample storage for display
+#define MAX_SAMPLES 5
+struct SampleResult {
+    uint16_t indices[MAX_WORDS];
+    uint8_t private_key[32];
+    uint8_t pubkey_hash[20];
+    uint32_t word_count;
+};
+__device__ SampleResult d_samples[MAX_SAMPLES];
+__device__ uint32_t d_sample_count = 0;
+
+
 // ============================================================================
 // Device constants
 // ============================================================================
@@ -309,7 +321,18 @@ __global__ void kernel_validate_checksums(
     valid_flags[tid] = valid ? 1 : 0;
     
     if (valid) {
-        atomicAdd((unsigned long long*)valid_count, 1ULL);
+        uint64_t count = atomicAdd((unsigned long long*)valid_count, 1ULL);
+        
+        // Store samples (every Nth valid phrase)
+        if (count % 1000000 == 0) {
+            uint32_t slot = atomicAdd(&d_sample_count, 1);
+            if (slot < MAX_SAMPLES) {
+                for (uint32_t i = 0; i < word_count; i++) {
+                    d_samples[slot].indices[i] = indices[i];
+                }
+                d_samples[slot].word_count = word_count;
+            }
+        }
     }
 }
 
@@ -659,6 +682,42 @@ int main(int argc, char** argv) {
     printf("Valid checksums: %llu\n", (unsigned long long)g_valid_checksums.load());
     printf("Found: %u\n", g_found.load());
     printf("============================================================\n");
+    
+    // Display sample valid phrases with full derivation
+    printf("\n============ SAMPLE VALID PHRASES ============\n");
+    
+    SampleResult h_samples[MAX_SAMPLES];
+    uint32_t h_sample_count = 0;
+    cudaMemcpyFromSymbol(h_samples, d_samples, sizeof(SampleResult) * MAX_SAMPLES);
+    cudaMemcpyFromSymbol(&h_sample_count, d_sample_count, sizeof(uint32_t));
+    
+    printf("Found %u sample valid phrases:\n\n", h_sample_count);
+    
+    for (uint32_t s = 0; s < h_sample_count && s < MAX_SAMPLES; s++) {
+        printf("--- Sample %u ---\n", s + 1);
+        
+        // Build mnemonic
+        printf("Mnemonic: ");
+        for (uint32_t w = 0; w < h_samples[s].word_count && w < 12; w++) {
+            if (w > 0) printf(" ");
+            printf("%s", wordlist[h_samples[s].indices[w]]);
+        }
+        printf("\n");
+        
+        // Indices
+        printf("Indices:  ");
+        for (uint32_t w = 0; w < h_samples[s].word_count && w < 12; w++) {
+            if (w > 0) printf(" ");
+            printf("%u", h_samples[s].indices[w]);
+        }
+        printf("\n");
+        
+        // Note: Full PBKDF2 derivation for display would be slow
+        // For now just show indices and mnemonic
+        printf("\n");
+    }
+    
+    printf("==============================================\n");
     
     // Cleanup
     cudaFree(d_base_indices);
