@@ -29,8 +29,8 @@
 #include "bip39.cuh"
 #include "base58.cuh"
 #include "bech32.cuh"
+#include "pbkdf2_opt.cuh"
 
-// Configurações - agora configuráveis via argumentos
 static uint32_t g_threads_per_block = 256;
 static uint32_t g_batch_size_millions = 4;
 static uint32_t g_num_streams = 4;  // Número de streams por GPU
@@ -508,17 +508,13 @@ __global__ void search_kernel_v2(
     
     atomicAdd((unsigned long long*)valid_count, 1ULL);
     
-#include "pbkdf2_opt.cuh" // Make sure this is included at top of file
-
-// ... inside kernel ...
-
     // Hashing da frase mnemônica diretamente dos índices (sem construir string)
     // Se a frase > 128 bytes (o que é verdade para 24 palavras), o PBKDF2 usa SHA512(frase) como chave.
     // Vamos calcular esse hash diretamente.
     uint8_t mnemonic_hash[64];
     {
-        SHA512State ctx;
-        sha512_init_state(&ctx);
+        SHA512State_t ctx;
+        sha512_init_state_opt(&ctx);
         
         uint8_t block[128];
         uint32_t buf_len = 0;
@@ -529,7 +525,7 @@ __global__ void search_kernel_v2(
             if (i > 0) {
                 block[buf_len++] = ' ';
                 if (buf_len == 128) {
-                    sha512_transform_block_raw(&ctx, block);
+                    sha512_transform_block_raw_opt(&ctx, block);
                     buf_len = 0;
                     total_len += 128;
                 }
@@ -539,7 +535,7 @@ __global__ void search_kernel_v2(
             for (int c = 0; c < 8 && word[c]; c++) {
                 block[buf_len++] = word[c];
                 if (buf_len == 128) {
-                    sha512_transform_block_raw(&ctx, block);
+                    sha512_transform_block_raw_opt(&ctx, block);
                     buf_len = 0;
                     total_len += 128;
                 }
@@ -550,9 +546,11 @@ __global__ void search_kernel_v2(
         
         // Finalizar SHA512 (padding)
         block[buf_len++] = 0x80;
+        // Padding simples garantido para buffer de 128
+        // Se exceder 112, processa e ZERA o buffer
         if (buf_len > 112) {
             while (buf_len < 128) block[buf_len++] = 0;
-            sha512_transform_block_raw(&ctx, block);
+            sha512_transform_block_raw_opt(&ctx, block);
             buf_len = 0;
         }
         while (buf_len < 112) block[buf_len++] = 0;
@@ -569,8 +567,8 @@ __global__ void search_kernel_v2(
         block[126] = (bit_len >> 8) & 0xFF;
         block[127] = bit_len & 0xFF;
         
-        sha512_transform_block_raw(&ctx, block);
-        sha512_extract(&ctx, mnemonic_hash);
+        sha512_transform_block_raw_opt(&ctx, block);
+        sha512_extract_opt(&ctx, mnemonic_hash);
     }
     
     // Derivar seed via PBKDF2 Otimizado
