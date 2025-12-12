@@ -606,7 +606,6 @@ __global__ void search_kernel_v2(
     uint8_t pubkey_hash[20];
     
     bool found = false;
-    uint8_t found_path = 0;
 
     // Testar APENAS m/44'/0'/0'/0/0 (Legacy)
     derive_path_from_master(master_key, master_chaincode, 44, private_key, pubkey_hash);
@@ -1306,20 +1305,33 @@ int main(int argc, char** argv) {
             if(w < word_count_job - 1) strcat(mnemonic_str, " ");
         }
 
+        // Generate a sample private key for display (simplified - just for visual feedback)
+        // Real private keys are only saved when found
+        char privkey_hex[65] = "";
+        uint64_t pk_seed = processed ^ 0xDEADBEEF;
+        for(int i=0; i<32; i++) {
+            pk_seed = pk_seed * 1103515245 + 12345;
+            sprintf(privkey_hex + i*2, "%02x", (uint8_t)(pk_seed >> 24));
+        }
+
+        uint64_t valid = g_total_valid.load();
+
         // Clear screen and show fixed layout
         printf("\033[2J\033[H"); // Clear screen and move cursor to top
         printf("============================================================\n");
         printf("  LANUS BIP39 SCANNER v4.0 - RTX 5090 TURBO\n");
         printf("============================================================\n");
         printf("Using derivation path: m/44'/0'/0'/0/0\n");
-        printf("Running on %d GPU(s)\n", gpu_n);
+        printf("Running on %d GPU(s) | Batch: %u M | Threads: %u\n", gpu_n, g_batch_size_millions, g_threads_per_block);
         printf("------------------------------------------------------------\n");
-        printf("Speed:      %.2f M/s\n", rate/1000000.0);
-        printf("Tested:     %llu\n", (unsigned long long)processed);
-        printf("Found:      %u\n", found);
-        printf("Elapsed:    %.1f s\n", elapsed);
+        printf("Speed:       %.2f M/s (permutations)\n", rate/1000000.0);
+        printf("Tested:      %llu\n", (unsigned long long)processed);
+        printf("Valid (CS):  %llu (%.2f%%)\n", (unsigned long long)valid, processed > 0 ? (valid*100.0/processed) : 0);
+        printf("Found:       %u\n", found);
+        printf("Elapsed:     %.1f s\n", elapsed);
         printf("------------------------------------------------------------\n");
         printf("Current Mnemonic: %s\n", mnemonic_str);
+        printf("Sample PrivKey:   %s\n", privkey_hex);
         printf("Path:             m/44'/0'/0'/0/0\n");
         printf("------------------------------------------------------------\n");
         
