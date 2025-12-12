@@ -65,6 +65,101 @@ __constant__ uint32_t d_num_targets;
 // SHA-256 K constants are in sha256.cuh
 
 // ============================================================================
+// HMAC-SHA512 for BIP32 derivation
+// ============================================================================
+__device__ void hmac_sha512(const uint8_t* key, size_t key_len, 
+                            const uint8_t* data, size_t data_len, 
+                            uint8_t* out) {
+    uint8_t k_ipad[128], k_opad[128];
+    
+    for (int i = 0; i < 128; i++) {
+        uint8_t kb = (i < key_len) ? key[i] : 0;
+        k_ipad[i] = kb ^ 0x36;
+        k_opad[i] = kb ^ 0x5c;
+    }
+    
+    // Inner hash
+    uint8_t inner[64];
+    SHA512State_t ctx;
+    sha512_init_state_opt(&ctx);
+    sha512_transform_block_raw_opt(&ctx, k_ipad);
+    
+    uint8_t block[128];
+    memcpy(block, data, data_len);
+    block[data_len] = 0x80;
+    memset(block + data_len + 1, 0, 128 - data_len - 1);
+    
+    if (data_len < 112) {
+        uint64_t bit_len = (128 + data_len) * 8;
+        block[120] = (bit_len >> 56) & 0xFF;
+        block[121] = (bit_len >> 48) & 0xFF;
+        block[122] = (bit_len >> 40) & 0xFF;
+        block[123] = (bit_len >> 32) & 0xFF;
+        block[124] = (bit_len >> 24) & 0xFF;
+        block[125] = (bit_len >> 16) & 0xFF;
+        block[126] = (bit_len >> 8) & 0xFF;
+        block[127] = bit_len & 0xFF;
+        sha512_transform_block_raw_opt(&ctx, block);
+    }
+    sha512_extract_opt(&ctx, inner);
+    
+    // Outer hash
+    sha512_init_state_opt(&ctx);
+    sha512_transform_block_raw_opt(&ctx, k_opad);
+    memcpy(block, inner, 64);
+    block[64] = 0x80;
+    memset(block + 65, 0, 128 - 65);
+    uint64_t bit_len = (128 + 64) * 8;
+    block[120] = (bit_len >> 56) & 0xFF;
+    block[121] = (bit_len >> 48) & 0xFF;
+    block[122] = (bit_len >> 40) & 0xFF;
+    block[123] = (bit_len >> 32) & 0xFF;
+    block[124] = (bit_len >> 24) & 0xFF;
+    block[125] = (bit_len >> 16) & 0xFF;
+    block[126] = (bit_len >> 8) & 0xFF;
+    block[127] = bit_len & 0xFF;
+    sha512_transform_block_raw_opt(&ctx, block);
+    sha512_extract_opt(&ctx, out);
+}
+
+// ============================================================================
+// BIP32 Child Key Derivation
+// ============================================================================
+__device__ void derive_child_key(
+    const uint8_t* parent_key,
+    const uint8_t* parent_chaincode,
+    uint32_t index,
+    uint8_t* child_key,
+    uint8_t* child_chaincode,
+    bool hardened
+) {
+    uint8_t data[37];
+    uint8_t I[64];
+    
+    if (hardened) {
+        index |= 0x80000000;
+        data[0] = 0x00;
+        memcpy(data + 1, parent_key, 32);
+    } else {
+        uint8_t pubkey[33];
+        secp256k1_get_pubkey_compressed(parent_key, pubkey);
+        memcpy(data, pubkey, 33);
+    }
+    
+    data[33] = (index >> 24) & 0xFF;
+    data[34] = (index >> 16) & 0xFF;
+    data[35] = (index >> 8) & 0xFF;
+    data[36] = index & 0xFF;
+    
+    hmac_sha512(parent_chaincode, 32, data, 37, I);
+    
+    // Add parent key to derived key (mod n)
+    secp256k1_scalar_add(I, parent_key, child_key);
+    memcpy(child_chaincode, I + 32, 32);
+}
+
+
+// ============================================================================
 // Ultra-fast SHA-256 for checksum (device)
 // ============================================================================
 __device__ __forceinline__ uint32_t rotr32(uint32_t x, int n) {
