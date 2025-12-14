@@ -77,13 +77,14 @@ __device__ __forceinline__ void uint256_set_one(uint256_t* a) {
     for (int i = 1; i < 8; i++) a->d[i] = 0;
 }
 
-__device__ void uint256_add(uint256_t* r, const uint256_t* a, const uint256_t* b) {
+__device__ bool uint256_add(uint256_t* r, const uint256_t* a, const uint256_t* b) {
     uint64_t carry = 0;
     for (int i = 0; i < 8; i++) {
         uint64_t sum = (uint64_t)a->d[i] + (uint64_t)b->d[i] + carry;
         r->d[i] = (uint32_t)sum;
         carry = sum >> 32;
     }
+    return carry != 0;
 }
 
 __device__ void uint256_sub(uint256_t* r, const uint256_t* a, const uint256_t* b) {
@@ -108,9 +109,25 @@ __device__ void uint256_mod(uint256_t* r, const uint256_t* a, const uint256_t* m
 }
 
 __device__ void uint256_mod_add(uint256_t* r, const uint256_t* a, const uint256_t* b, const uint256_t* m) {
-    uint256_add(r, a, b);
-    if (uint256_compare(r, m) >= 0) {
-        uint256_sub(r, r, m);
+    bool carry = uint256_add(r, a, b);
+    if (carry) {
+        // Result overflowed 256 bits. Actual logical value is r + 2^256.
+        // We want (r + 2^256) mod m.
+        // Since m < 2^256, (r + 2^256) - m = r + (2^256 - m).
+        // Let k = 2^256 - m.
+        // r = r + k.
+        
+        // Calculate k = 0 - m (in 256-bit arithmetic 0 is 2^256)
+        uint256_t zero = {{0}};
+        uint256_t k;
+        uint256_sub(&k, &zero, m);
+        
+        // Now add k to r. (This shouldn't overflow usually if m is close to 2^256)
+        uint256_add(r, r, &k);
+    } else {
+        if (uint256_compare(r, m) >= 0) {
+            uint256_sub(r, r, m);
+        }
     }
 }
 
@@ -125,49 +142,96 @@ __device__ void uint256_mod_sub(uint256_t* r, const uint256_t* a, const uint256_
 }
 
 // Multiplicação 256x256 -> 512 bits (produto completo)
+// Multiplicação 256x256 -> 512 bits (produto completo)
 __device__ void uint256_mul_full(uint32_t* r, const uint256_t* a, const uint256_t* b) {
     uint64_t acc = 0;
+    
     #pragma unroll
     for (int k = 0; k < 16; k++) {
+        uint32_t extra_carry = 0;
+        
         for (int i = (k < 8 ? 0 : k - 7); i <= (k < 8 ? k : 7); i++) {
             int j = k - i;
-            acc += (uint64_t)a->d[i] * (uint64_t)b->d[j];
+            uint64_t prod = (uint64_t)a->d[i] * (uint64_t)b->d[j];
+            uint64_t prev_acc = acc;
+            acc += prod;
+            if (acc < prev_acc) extra_carry++;
         }
         r[k] = (uint32_t)acc;
         acc >>= 32;
+        acc |= ((uint64_t)extra_carry << 32);
     }
 }
 
 // Redução rápida mod p para secp256k1: p = 2^256 - 2^32 - 977
 // Para r[0..15] (512 bits), reduz para 256 bits mod p
 __device__ void secp256k1_reduce(uint256_t* r, const uint32_t* t) {
-    // p = 2^256 - c onde c = 2^32 + 977 = 0x1000003D1
-    // t = t_lo + t_hi * 2^256
+    // p = 2^256 - c where c = 2^32 + 977
     // t mod p = t_lo + t_hi * c (mod p)
+    //         = t_lo + t_hi * (2^32 + 977)
+    //         = t_lo + (t_hi << 32) + t_hi * 977
     
-    uint64_t c0 = 0x1000003D1ULL;
+    uint64_t c_lo = 977;
     uint64_t carry = 0;
-    uint32_t tmp[9];
+    uint32_t tmp[8]; 
     
-    // Fase 1: t_lo + t_hi * c
+    // Phase 1: Calculate t_lo + (t_hi << 32) + t_hi * 977
+    // Store first 8 words in tmp, keep overflow in sum_final
+    
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        uint64_t sum = (uint64_t)t[i] + (uint64_t)t[i + 8] * c0 + carry;
+        // t_lo term: t[i]
+        // t_hi * 977 term: t[i+8] * 977
+        // t_hi << 32 term: t[i-1+8] -> t[i+7] (for i>0)
+        
+        uint64_t sum = (uint64_t)t[i] + (uint64_t)t[i + 8] * c_lo + carry;
+        
+        if (i > 0) {
+            sum += t[i + 7];
+        }
+        
         tmp[i] = (uint32_t)sum;
         carry = sum >> 32;
     }
-    tmp[8] = (uint32_t)carry;
     
-    // Fase 2: se tmp >= 2^256, reduzir novamente
-    carry = (uint64_t)tmp[8] * c0;
+    // Capture the total overflow > 2^256
+    // Overflow comes from:
+    // 1. carry from the loop
+    // 2. The last term of (t_hi << 32) which is t[15]
+    uint64_t sum_final = carry + t[15];
+    
+    // Phase 2: Reduce the overflow
+    // overflow * 2^256 = sum_final * c = sum_final * (2^32 + 977)
+    // Add (sum_final * 977) and (sum_final << 32) to tmp
+    
+    carry = 0;
+    
+    // Word 0: add (sum_final * 977)_lo
+    uint64_t val_977 = sum_final * c_lo;
+    uint64_t s = (uint64_t)tmp[0] + (val_977 & 0xFFFFFFFFULL) + carry;
+    r->d[0] = (uint32_t)s;
+    carry = s >> 32;
+    
+    // Word 1: add (sum_final * 977)_hi + (sum_final)_lo
+    s = (uint64_t)tmp[1] + (val_977 >> 32) + (sum_final & 0xFFFFFFFFULL) + carry;
+    r->d[1] = (uint32_t)s;
+    carry = s >> 32;
+    
+    // Word 2: add (sum_final)_hi
+    s = (uint64_t)tmp[2] + (sum_final >> 32) + carry;
+    r->d[2] = (uint32_t)s;
+    carry = s >> 32;
+    
+    // Propagate carry for remaining words
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        uint64_t sum = (uint64_t)tmp[i] + (carry & 0xFFFFFFFF);
-        r->d[i] = (uint32_t)sum;
-        carry = (sum >> 32) + (carry >> 32);
+    for (int i = 3; i < 8; i++) {
+        s = (uint64_t)tmp[i] + carry;
+        r->d[i] = (uint32_t)s;
+        carry = s >> 32;
     }
     
-    // Fase 3: se ainda >= p, subtrair p uma vez
+    // Phase 3: if result >= P, subtract P
+    // If we have carry out, we are definitely >= 2^256 > P
     if (carry || uint256_compare(r, &SECP256K1_P) >= 0) {
         uint256_sub(r, r, &SECP256K1_P);
     }
@@ -188,20 +252,35 @@ __device__ void uint256_mod_sqr(uint256_t* r, const uint256_t* a) {
     // Termos diagonais + 2 * termos cruzados
     #pragma unroll
     for (int k = 0; k < 16; k++) {
+        uint32_t extra_carry = 0;
         int start = (k < 8 ? 0 : k - 7);
         int end = k / 2;
         
         for (int i = start; i <= end; i++) {
             int j = k - i;
             uint64_t prod = (uint64_t)a->d[i] * (uint64_t)a->d[j];
+            
             if (i < j) {
-                acc += prod * 2;
+                // Accumulate 2 * prod
+                // prod * 2 might overflow 64 bits, carry is in MSB of prod
+                uint32_t msb = prod >> 63;
+                uint64_t double_prod = prod << 1;
+                
+                extra_carry += msb;
+                
+                uint64_t prev = acc;
+                acc += double_prod;
+                if (acc < prev) extra_carry++;
             } else {
+                // Accumulate prod
+                uint64_t prev = acc;
                 acc += prod;
+                if (acc < prev) extra_carry++;
             }
         }
         t[k] = (uint32_t)acc;
         acc >>= 32;
+        acc |= ((uint64_t)extra_carry << 32);
     }
     
     secp256k1_reduce(r, t);
@@ -279,6 +358,7 @@ __device__ void point_double(point_t* r, const point_t* p) {
 }
 
 // Adicionar dois pontos na curva
+// Adicionar dois pontos na curva
 __device__ void point_add(point_t* r, const point_t* p, const point_t* q) {
     if (p->infinity) {
         r->x = q->x;
@@ -302,11 +382,14 @@ __device__ void point_add(point_t* r, const point_t* p, const point_t* q) {
     uint256_mod_mul(&U1, &p->x, &Z2Z2, &SECP256K1_P);
     uint256_mod_mul(&U2, &q->x, &Z1Z1, &SECP256K1_P);
 
-    uint256_t Z1Z3, Z2Z3;
-    uint256_mod_mul(&Z1Z3, &p->z, &Z2Z2, &SECP256K1_P);
-    uint256_mod_mul(&Z2Z3, &q->z, &Z1Z1, &SECP256K1_P);
-    uint256_mod_mul(&S1, &p->y, &Z2Z3, &SECP256K1_P);
-    uint256_mod_mul(&S2, &q->y, &Z1Z3, &SECP256K1_P);
+    uint256_t Z1_cubed, Z2_cubed;
+    // S1 = Y1 * Z2^3
+    uint256_mod_mul(&Z2_cubed, &q->z, &Z2Z2, &SECP256K1_P);
+    uint256_mod_mul(&S1, &p->y, &Z2_cubed, &SECP256K1_P);
+    
+    // S2 = Y2 * Z1^3
+    uint256_mod_mul(&Z1_cubed, &p->z, &Z1Z1, &SECP256K1_P);
+    uint256_mod_mul(&S2, &q->y, &Z1_cubed, &SECP256K1_P);
 
     if (uint256_compare(&U1, &U2) == 0) {
         if (uint256_compare(&S1, &S2) == 0) {

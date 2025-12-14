@@ -37,6 +37,7 @@
 #define PBKDF2_BATCH_SIZE 4096         // Smaller batch for heavy PBKDF2
 #define MAX_WORDS 24
 #define PBKDF2_ITERATIONS 2048
+#define DEBUG_MODE 0  // Set to 1 to enable debug output
 
 // Global counters
 std::atomic<uint64_t> g_permutations_tested(0);
@@ -86,7 +87,8 @@ __device__ void derive_child_key(
     uint32_t index,
     uint8_t* child_key,
     uint8_t* child_chaincode,
-    bool hardened
+    bool hardened,
+    bool debug = false
 ) {
     uint8_t data[37];
     uint8_t I[64];
@@ -106,7 +108,19 @@ __device__ void derive_child_key(
     data[35] = (index >> 8) & 0xFF;
     data[36] = index & 0xFF;
     
+    if (debug) {
+        printf("DEBUG data: ");
+        for(int k=0; k<37; k++) printf("%02x", data[k]);
+        printf("\n");
+    }
+    
     hmac_sha512(parent_chaincode, 32, data, 37, I);
+    
+    if (debug) {
+        printf("DEBUG IL: ");
+        for(int k=0; k<32; k++) printf("%02x", I[k]);
+        printf("\n");
+    }
     
     // Add parent key to derived key (mod n)
     secp256k1_scalar_add(I, parent_key, child_key);
@@ -299,7 +313,8 @@ __global__ void kernel_validate_checksums(
     const uint16_t* base_indices,
     uint32_t word_count,
     uint8_t* valid_flags,
-    uint64_t* valid_count
+    uint64_t* valid_count,
+    uint16_t* valid_phrases_buffer
 ) {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= batch_size) return;
@@ -318,21 +333,44 @@ __global__ void kernel_validate_checksums(
         valid = verify_checksum_24(indices);
     }
     
+    // Debug specific target sequence (galaxy man ...)
+    bool exact_match = false;
+    if (word_count == 12) {
+        uint16_t expected[] = {759, 1078, 213, 623, 521, 319, 416, 302, 566, 1104, 191, 1666};
+        exact_match = true;
+        for(int i=0; i<12; i++) {
+             if (indices[i] != expected[i]) {
+                 exact_match = false;
+                 break;
+             }
+        }
+    }
+    
+    if (exact_match) {
+         printf("\n!!! FOUND EXACT TARGET AT K=%llu !!!\n", (unsigned long long)k);
+         printf("Indices: ");
+         for(int i=0; i<word_count; i++) printf("%d ", indices[i]);
+         printf("\n");
+         printf("Valid Checksum: %d\n", valid);
+         if (!valid) printf("WARNING: CHECKSUM FAILED FOR TARGET!\n");
+    }
+    
+    if (k == 0) {
+        printf("\nK=0 GENERATED INDICES: ");
+        for(int i=0; i<word_count; i++) printf("%d ", indices[i]);
+        printf("\n");
+    }
+    
     valid_flags[tid] = valid ? 1 : 0;
     
     if (valid) {
         uint64_t count = atomicAdd((unsigned long long*)valid_count, 1ULL);
         
-        // Store samples (every Nth valid phrase)
-        if (count % 1000000 == 0) {
-            uint32_t slot = atomicAdd(&d_sample_count, 1);
-            if (slot < MAX_SAMPLES) {
-                for (uint32_t i = 0; i < word_count; i++) {
-                    d_samples[slot].indices[i] = indices[i];
-                }
-                d_samples[slot].word_count = word_count;
-            }
+        // Store indices for Phase 2
+        for (int i = 0; i < word_count; i++) {
+            valid_phrases_buffer[count * word_count + i] = indices[i];
         }
+        // Note: Samples are now saved in Phase 2 where we have the hash160
     }
 }
 
@@ -343,7 +381,7 @@ __global__ void kernel_derive_and_check(
     const uint16_t* valid_phrases,  // Packed valid phrase indices
     uint32_t num_valid,
     uint32_t word_count,
-    char wordlist[2048][9],
+    char wordlist[2048][16],
     uint32_t* found_count,
     uint8_t* found_privkeys,
     uint16_t* found_indices
@@ -353,6 +391,19 @@ __global__ void kernel_derive_and_check(
     
     const uint16_t* indices = valid_phrases + tid * word_count;
     
+    // Debug: Check if we are processing target indices
+    bool is_target_indices = false;
+    if (word_count == 12) {
+        uint16_t expected[] = {759, 1078, 213, 623, 521, 319, 416, 302, 566, 1104, 191, 1666};
+        is_target_indices = true;
+        for(int i=0; i<12; i++) {
+             if (indices[i] != expected[i]) {
+                 is_target_indices = false;
+                 break;
+             }
+        }
+    }
+    
     // Build mnemonic string
     uint8_t mnemonic[256];
     int mnem_len = 0;
@@ -360,58 +411,57 @@ __global__ void kernel_derive_and_check(
     for (uint32_t w = 0; w < word_count; w++) {
         if (w > 0) mnemonic[mnem_len++] = ' ';
         const char* word = wordlist[indices[w]];
-        for (int i = 0; word[i] && i < 8; i++) {
+        // Copy full word (BIP39 words are max 8 chars, but use full length for safety)
+        for (int i = 0; word[i] && i < 16; i++) {
             mnemonic[mnem_len++] = word[i];
         }
     }
+    
+    if (is_target_indices) {
+         // Found target permutation
+         printf("\n!!! PHASE 2: PROCESSING TARGET INDICES (TID=%llu) !!!\n", (unsigned long long)tid);
+    }
+    
+    // Debug: print first mnemonic
+    #if DEBUG_MODE
+    if (tid == 0) {
+        mnemonic[mnem_len] = 0;
+        printf("[DEBUG] MNEMONIC: %s\n", (char*)mnemonic);
+        printf("[DEBUG] INDICES: ");
+        for(uint32_t w=0; w<word_count; w++) printf("%d ", indices[w]);
+        printf("\n");
+    }
+    #endif
     
     // PBKDF2-SHA512 to derive seed
     uint8_t seed[64];
     const char* salt = "mnemonic";
     
-    // Use optimized PBKDF2
-    uint8_t mnemonic_hash[64];
-    
-    // Hash mnemonic first
-    SHA512State_t ctx;
-    sha512_init_state_opt(&ctx);
-    
-    // Process mnemonic in blocks
-    uint8_t block[128];
-    int buf_len = 0;
-    for (int i = 0; i < mnem_len; i++) {
-        block[buf_len++] = mnemonic[i];
-        if (buf_len == 128) {
-            sha512_transform_block_raw_opt(&ctx, block);
-            buf_len = 0;
-        }
+    // BIP39: PBKDF2(password=mnemonic, salt="mnemonic", iterations=2048)
+    // Pass mnemonic directly with its length
+    pbkdf2_sha512_mnemonic(mnemonic, mnem_len, (const uint8_t*)salt, 8, PBKDF2_ITERATIONS, seed);
+
+    if (is_target_indices) {
+         printf("\n");
+         printf("Mnemonic length: %d bytes\n", mnem_len);
+         printf("Computed SEED: ");
+         for(int k=0; k<64; k++) printf("%02x", seed[k]);
+         printf("\n");
+         
+         // Expected seed for "galaxy man boy evil donkey child cross chair egg meat blood space"
+         // 4cd832a5c862ef5117870c15bdf792ed558499a2c81d8bd5c68f28bf0f66671b
+         // 76e6522d90fb4996cc29d1a7b37ccf0bcc8157dea21f5f065e89921841323ab8
+         printf("Expected SEED: 4cd832a5c862ef5117870c15bdf792ed558499a2c81d8bd5c68f28bf0f66671b76e6522d90fb4996cc29d1a7b37ccf0bcc8157dea21f5f065e89921841323ab8\n");
     }
+
     
-    // Pad and finalize
-    block[buf_len++] = 0x80;
-    if (buf_len > 112) {
-        while (buf_len < 128) block[buf_len++] = 0;
-        sha512_transform_block_raw_opt(&ctx, block);
-        buf_len = 0;
+    #if DEBUG_MODE
+    if (tid == 0) {
+        printf("[DEBUG] SEED: ");
+        for(int k=0; k<32; k++) printf("%02x", seed[k]);
+        printf("...\n");
     }
-    while (buf_len < 112) block[buf_len++] = 0;
-    
-    uint64_t bit_len = mnem_len * 8;
-    for (int i = 0; i < 8; i++) block[112 + i] = 0;
-    block[120] = (bit_len >> 56) & 0xFF;
-    block[121] = (bit_len >> 48) & 0xFF;
-    block[122] = (bit_len >> 40) & 0xFF;
-    block[123] = (bit_len >> 32) & 0xFF;
-    block[124] = (bit_len >> 24) & 0xFF;
-    block[125] = (bit_len >> 16) & 0xFF;
-    block[126] = (bit_len >> 8) & 0xFF;
-    block[127] = bit_len & 0xFF;
-    
-    sha512_transform_block_raw_opt(&ctx, block);
-    sha512_extract_opt(&ctx, mnemonic_hash);
-    
-    // PBKDF2
-    pbkdf2_sha512_optimized(mnemonic_hash, (const uint8_t*)salt, 8, PBKDF2_ITERATIONS, seed);
+    #endif
     
     // Derive master key
     uint8_t master_key[32], master_chaincode[32];
@@ -423,34 +473,70 @@ __global__ void kernel_derive_and_check(
         memcpy(master_chaincode, I + 32, 32);
     }
     
+    if (is_target_indices) {
+         printf("Computed MASTER KEY: ");
+         for(int k=0; k<32; k++) printf("%02x", master_key[k]);
+         printf("\n");
+         printf("Computed CHAIN CODE: ");
+         for(int k=0; k<32; k++) printf("%02x", master_chaincode[k]);
+         printf("\n");
+    }
+    
+    #if DEBUG_MODE
+    if (tid == 0) {
+        printf("[DEBUG] MASTER KEY: ");
+        for(int k=0; k<32; k++) printf("%02x", master_key[k]);
+        printf("\n");
+    }
+    #endif
+    
     // Derive m/44'/0'/0'/0/0
     uint8_t key[32], chaincode[32];
     uint8_t temp_key[32], temp_chaincode[32];
     
     // m/44'
-    derive_child_key(master_key, master_chaincode, 44, key, chaincode, true);
+    derive_child_key(master_key, master_chaincode, 44, key, chaincode, true, false);
+    // Debug disabled for m/44'
+    
     // m/44'/0'
-    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true);
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true, false);
     memcpy(key, temp_key, 32); memcpy(chaincode, temp_chaincode, 32);
+    // Debug disabled for m/44'/0'
+
     // m/44'/0'/0'
-    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true);
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true, false);
     memcpy(key, temp_key, 32); memcpy(chaincode, temp_chaincode, 32);
+    
     // m/44'/0'/0'/0
-    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, false);
+    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, false, false);
     memcpy(key, temp_key, 32); memcpy(chaincode, temp_chaincode, 32);
+    
     // m/44'/0'/0'/0/0
     uint8_t private_key[32];
-    derive_child_key(key, chaincode, 0, private_key, temp_chaincode, false);
+    derive_child_key(key, chaincode, 0, private_key, temp_chaincode, false, false);
     
     // Get public key hash
     uint8_t pubkey[33];
     secp256k1_get_pubkey_compressed(private_key, pubkey);
-    
+
     uint8_t sha_hash[32];
     sha256(pubkey, 33, sha_hash);
     
     uint8_t pubkey_hash[20];
     ripemd160(sha_hash, 32, pubkey_hash);
+    
+    // Save sample with hash160 (every Nth processed phrase)
+    if (tid % 1000000 == 0) {
+        uint32_t slot = atomicAdd(&d_sample_count, 1);
+        if (slot < MAX_SAMPLES) {
+            for (uint32_t i = 0; i < word_count; i++) {
+                d_samples[slot].indices[i] = indices[i];
+            }
+            d_samples[slot].word_count = word_count;
+            memcpy(d_samples[slot].private_key, private_key, 32);
+            memcpy(d_samples[slot].pubkey_hash, pubkey_hash, 20);
+        }
+    }
     
     // Check against bloom filter or targets
     bool found = false;
@@ -480,16 +566,20 @@ __global__ void kernel_derive_and_check(
             }
         }
     } else {
+    } else {
         for (uint32_t t = 0; t < d_num_targets && !found; t++) {
             bool match = true;
-            for (int j = 0; j < 20; j++) {
-                if (pubkey_hash[j] != d_target_hashes_ptr[t * 20 + j]) {
+            for (int k = 0; k < 20; k++) {
+                if (pubkey_hash[k] != d_target_hashes_ptr[t * 20 + k]) {
                     match = false;
                     break;
                 }
             }
-            if (match) found = true;
+            if (match) {
+                found = true;
+            }
         }
+    }
     }
     
     if (found) {
@@ -505,7 +595,7 @@ __global__ void kernel_derive_and_check(
 // Host functions
 // ============================================================================
 
-void load_wordlist(const char* filename, char wordlist[2048][9]) {
+void load_wordlist(const char* filename, char wordlist[2048][16]) {
     FILE* f = fopen(filename, "r");
     if (!f) {
         printf("Error: Cannot open wordlist %s\n", filename);
@@ -516,15 +606,19 @@ void load_wordlist(const char* filename, char wordlist[2048][9]) {
     int idx = 0;
     while (fgets(line, sizeof(line), f) && idx < 2048) {
         line[strcspn(line, "\r\n")] = 0;
-        strncpy(wordlist[idx], line, 8);
-        wordlist[idx][8] = 0;
+        // Initialize buffer to zeros to avoid garbage
+        memset(wordlist[idx], 0, 16);
+        // Copy full word (up to 15 chars to leave room for null terminator)
+        strncpy(wordlist[idx], line, 15);
         idx++;
     }
     fclose(f);
+    printf("First word in list: '%s'\n", wordlist[0]);
+    printf("Last word (idx-1): '%s'\n", wordlist[idx-1]);
     printf("Loaded %d words from wordlist\n", idx);
 }
 
-void load_target_words(const char* filename, char wordlist[2048][9], uint16_t* indices, uint32_t* count) {
+void load_target_words(const char* filename, char wordlist[2048][16], uint16_t* indices, uint32_t* count) {
     FILE* f = fopen(filename, "r");
     if (!f) {
         printf("Error: Cannot open words file %s\n", filename);
@@ -534,13 +628,18 @@ void load_target_words(const char* filename, char wordlist[2048][9], uint16_t* i
     char word[64];
     *count = 0;
     while (fscanf(f, "%s", word) == 1 && *count < MAX_WORDS) {
+        bool found_match = false;
         // Find word in wordlist
         for (int i = 0; i < 2048; i++) {
             if (strcmp(word, wordlist[i]) == 0) {
                 indices[*count] = i;
                 (*count)++;
+                found_match = true;
                 break;
             }
+        }
+        if (!found_match) {
+             printf("Warning: Word '%s' not found in wordlist!\n", word);
         }
     }
     fclose(f);
@@ -565,6 +664,10 @@ int main(int argc, char** argv) {
         printf("Usage: %s -words <words.txt> -a <addresses.txt> [--bloom <MB>]\n", argv[0]);
         return 1;
     }
+
+    // Increase stack size to prevent corruption in deep crypto functions
+    cudaDeviceSetLimit(cudaLimitStackSize, 8192);
+    cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 1024 * 1024 * 32); // 32MB printf buffer
     
     const char* words_file = NULL;
     const char* addr_file = NULL;
@@ -580,9 +683,33 @@ int main(int argc, char** argv) {
         printf("Error: Missing required arguments\n");
         return 1;
     }
+
+    // Load addresses
+    std::vector<uint8_t> target_hashes;
+    int num_targets = 0;
+    
+    FILE* f_addr = fopen(addr_file, "r");
+    if (f_addr) {
+        char line[128];
+        while (fgets(line, sizeof(line), f_addr)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (strlen(line) < 20) continue;
+            
+            uint8_t hash[20];
+            if (base58_decode_address(line, hash)) {
+                for(int i=0; i<20; i++) target_hashes.push_back(hash[i]);
+            }
+        }
+        fclose(f_addr);
+        num_targets = target_hashes.size() / 20;
+        printf("Loaded %d target addresses\n", num_targets);
+    } else {
+        printf("Error: Cannot open address file %s\n", addr_file);
+        return 1;
+    }
     
     // Load wordlist
-    char wordlist[2048][9];
+    char wordlist[2048][16];
     load_wordlist("wordlist.txt", wordlist);
     
     // Load target words
@@ -623,9 +750,36 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_valid_count, sizeof(uint64_t));
     
     // Copy wordlist to device
-    char (*d_wordlist)[9];
-    cudaMalloc(&d_wordlist, 2048 * 9);
-    cudaMemcpy(d_wordlist, wordlist, 2048 * 9, cudaMemcpyHostToDevice);
+    char (*d_wordlist)[16];
+    cudaMalloc(&d_wordlist, 2048 * 16);
+    cudaMemcpy(d_wordlist, wordlist, 2048 * 16, cudaMemcpyHostToDevice);
+
+    // Buffer for valid phrases (Phase 2 input)
+    uint16_t* d_valid_phrases;
+    // Size: Batch size * Max words. 16M * 24 * 2 bytes = 768MB. OK for 24GB VRAM.
+    cudaMalloc(&d_valid_phrases, BATCH_SIZE * MAX_WORDS * sizeof(uint16_t));
+
+    // Found results storage
+    uint32_t* d_found_count;
+    cudaMalloc(&d_found_count, sizeof(uint32_t));
+    cudaMemset(d_found_count, 0, sizeof(uint32_t));
+
+    uint8_t* d_found_privkeys;
+    cudaMalloc(&d_found_privkeys, 100 * 32); // Store up to 100 found keys
+
+    uint16_t* d_found_indices;
+    cudaMalloc(&d_found_indices, 100 * MAX_WORDS * sizeof(uint16_t));
+    
+    // Target hashes pointers
+    if (num_targets > 0) {
+        uint8_t* d_targets;
+        cudaMalloc(&d_targets, target_hashes.size());
+        cudaMemcpy(d_targets, target_hashes.data(), target_hashes.size(), cudaMemcpyHostToDevice);
+        
+        // Update device symbols
+        cudaMemcpyToSymbol(d_target_hashes_ptr, &d_targets, sizeof(uint8_t*));
+        cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(uint32_t));
+    }
     
     printf("\n============================================================\n");
     printf("Starting ULTRA-SPEED scan...\n");
@@ -649,13 +803,41 @@ int main(int argc, char** argv) {
         int blocks = (batch + threads - 1) / threads;
         
         kernel_validate_checksums<<<blocks, threads>>>(
-            k, batch, d_base_indices, word_count, d_valid_flags, d_valid_count
+            k, batch, d_base_indices, word_count, d_valid_flags, d_valid_count, d_valid_phrases
         );
         cudaDeviceSynchronize();
         
         // Get valid count
         uint64_t valid_in_batch;
         cudaMemcpy(&valid_in_batch, d_valid_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+        // Phase 2: PBKDF2 + Address Check
+        if (valid_in_batch > 0) {
+            int threads_p2 = 256;
+            int blocks_p2 = (valid_in_batch + threads_p2 - 1) / threads_p2;
+            
+            kernel_derive_and_check<<<blocks_p2, threads_p2>>>(
+                d_valid_phrases,
+                (uint32_t)valid_in_batch,
+                word_count,
+                d_wordlist,
+                d_found_count,
+                d_found_privkeys,
+                d_found_indices
+            );
+            cudaDeviceSynchronize();
+            
+            // Check found
+            uint32_t found_now;
+            cudaMemcpy(&found_now, d_found_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+            if (found_now > 0) {
+                g_found.store(found_now);
+                // We could break here if we just want one.
+                // But let's let it run or break?
+                // Let's print!
+                printf("\n[+] FOUND %u MATCHES!\n", found_now);
+            }
+        }
         
         g_permutations_tested += batch;
         g_valid_checksums += valid_in_batch;
@@ -666,14 +848,14 @@ int main(int argc, char** argv) {
         double elapsed = (double)(clock() - start_time) / CLOCKS_PER_SEC;
         double rate = g_permutations_tested / elapsed;
         
-        printf("\r[%.1f%%] Perms: %llu | Valid: %llu (%.2f%%) | Speed: %.2f M/s | Found: %u",
-               (k * 100.0 / total_perms),
-               (unsigned long long)g_permutations_tested.load(),
-               (unsigned long long)g_valid_checksums.load(),
-               (g_valid_checksums.load() * 100.0 / g_permutations_tested.load()),
-               rate / 1000000.0,
-               g_found.load());
-        fflush(stdout);
+        // printf("\r[%.1f%%] Perms: %llu | Valid: %llu (%.2f%%) | Speed: %.2f M/s | Found: %u",
+        //        (k * 100.0 / total_perms),
+        //        (unsigned long long)g_permutations_tested.load(),
+        //        (unsigned long long)g_valid_checksums.load(),
+        //        (g_valid_checksums.load() * 100.0 / g_permutations_tested.load()),
+        //        rate / 1000000.0,
+        //        g_found.load());
+        // fflush(stdout);
     }
     
     printf("\n\n============================================================\n");
@@ -711,9 +893,10 @@ int main(int argc, char** argv) {
             printf("%u", h_samples[s].indices[w]);
         }
         printf("\n");
-        
-        // Note: Full PBKDF2 derivation for display would be slow
-        // For now just show indices and mnemonic
+
+        printf("Address Hash: ");
+        for (int i = 0; i < 20; i++) printf("%02x", h_samples[s].pubkey_hash[i]);
+        printf("\n");
         printf("\n");
     }
     
@@ -723,6 +906,10 @@ int main(int argc, char** argv) {
     cudaFree(d_base_indices);
     cudaFree(d_valid_flags);
     cudaFree(d_valid_count);
+    cudaFree(d_valid_phrases);
+    cudaFree(d_found_count);
+    cudaFree(d_found_privkeys);
+    cudaFree(d_found_indices);
     cudaFree(d_wordlist);
     
     return 0;

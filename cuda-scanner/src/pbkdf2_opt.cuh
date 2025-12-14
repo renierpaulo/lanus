@@ -205,4 +205,104 @@ __device__ void pbkdf2_sha512_optimized(
     for(int i=0; i<64; i++) output_64bytes[i] = T[i];
 }
 
+// PBKDF2-SHA512 for variable-length mnemonic (BIP39 compliant)
+__device__ void pbkdf2_sha512_mnemonic(
+    const uint8_t* password, uint32_t password_len,
+    const uint8_t* salt, uint32_t salt_len,
+    uint32_t iterations,
+    uint8_t* output_64bytes
+) {
+    // Key preparation for HMAC: if password > 128, hash it; else pad with zeros
+    uint8_t key[128];
+    for(int i=0; i<128; i++) key[i] = 0;
+    
+    if (password_len <= 128) {
+        for(uint32_t i=0; i<password_len; i++) key[i] = password[i];
+    } else {
+        // Hash the password (rare case for BIP39)
+        sha512(password, password_len, key);
+    }
+    
+    uint8_t k_ipad[128];
+    uint8_t k_opad[128];
+    
+    for(int i=0; i<128; i++) {
+        k_ipad[i] = key[i] ^ 0x36;
+        k_opad[i] = key[i] ^ 0x5c;
+    }
+    
+    SHA512State_t ctx_inner_pre, ctx_outer_pre;
+    sha512_init_state_opt(&ctx_inner_pre);
+    sha512_transform_block_raw_opt(&ctx_inner_pre, k_ipad);
+    
+    sha512_init_state_opt(&ctx_outer_pre);
+    sha512_transform_block_raw_opt(&ctx_outer_pre, k_opad);
+    
+    uint8_t U[64], T[64];
+    
+    // First iteration: HMAC(key, salt || INT(1))
+    {
+        SHA512State_t ctx = ctx_inner_pre;
+        
+        // Process salt + block number
+        uint8_t msg[128];
+        for(int i=0; i<128; i++) msg[i] = 0;
+        
+        uint32_t msg_len = 0;
+        for(uint32_t i=0; i<salt_len && msg_len<124; i++) msg[msg_len++] = salt[i];
+        
+        // Append block number (1) as big-endian 32-bit
+        msg[msg_len++] = 0x00;
+        msg[msg_len++] = 0x00;
+        msg[msg_len++] = 0x00;
+        msg[msg_len++] = 0x01;
+        
+        // CRITICAL FIX: Calculate bit_len BEFORE adding padding
+        // bit_len = (k_ipad block: 128 bytes) + (current message: salt + block_number)
+        uint64_t bit_len = (128 + msg_len) * 8;
+        
+        // Now add padding byte
+        msg[msg_len] = 0x80;
+        msg_len++;
+        
+        // Place length in last 8 bytes of the block (big-endian)
+        msg[120] = (bit_len >> 56) & 0xFF;
+        msg[121] = (bit_len >> 48) & 0xFF;
+        msg[122] = (bit_len >> 40) & 0xFF;
+        msg[123] = (bit_len >> 32) & 0xFF;
+        msg[124] = (bit_len >> 24) & 0xFF;
+        msg[125] = (bit_len >> 16) & 0xFF;
+        msg[126] = (bit_len >> 8) & 0xFF;
+        msg[127] = bit_len & 0xFF;
+        
+        sha512_transform_block_raw_opt(&ctx, msg);
+        
+        uint8_t inner_hash[64];
+        sha512_extract_opt(&ctx, inner_hash);
+        
+        // Outer HMAC
+        SHA512State_t ctx_out = ctx_outer_pre;
+        sha512_finish_block2_192bytes_opt(&ctx_out, inner_hash);
+        sha512_extract_opt(&ctx_out, U);
+        
+        for(int i=0; i<64; i++) T[i] = U[i];
+    }
+    
+    // Remaining iterations
+    for(uint32_t iter=1; iter<iterations; iter++) {
+        SHA512State_t ctx = ctx_inner_pre;
+        sha512_finish_block2_192bytes_opt(&ctx, U);
+        uint8_t inner_hash[64];
+        sha512_extract_opt(&ctx, inner_hash);
+        
+        ctx = ctx_outer_pre;
+        sha512_finish_block2_192bytes_opt(&ctx, inner_hash);
+        sha512_extract_opt(&ctx, U);
+        
+        for(int j=0; j<64; j++) T[j] ^= U[j];
+    }
+    
+    for(int i=0; i<64; i++) output_64bytes[i] = T[i];
+}
+
 #endif
