@@ -35,7 +35,7 @@
 // ============================================================================
 #define BATCH_SIZE (1024 * 1024 * 16)  // 16M per batch for checksum validation
 #define PBKDF2_BATCH_SIZE 4096         // Smaller batch for heavy PBKDF2
-#define MAX_WORDS 24
+#define MAX_WORDS 40
 #define PBKDF2_ITERATIONS 2048
 #define DEBUG_MODE 0  // Set to 1 to enable debug output
 
@@ -72,7 +72,7 @@ __constant__ uint32_t d_bloom_k;
 __constant__ uint32_t d_use_bloom;
 
 // Target hashes
-__device__ uint8_t* d_target_hashes_ptr = nullptr;
+__constant__ uint8_t* d_target_hashes_ptr = nullptr;
 __constant__ uint32_t d_num_targets;
 
 // SHA-256 K constants are in sha256.cuh
@@ -194,7 +194,84 @@ __device__ void sha256_checksum_only(const uint8_t* entropy, int ent_bytes, uint
 }
 
 // ============================================================================
-// Permutation index to word indices (k -> perm)
+// Simple LCG random number generator for CUDA
+// ============================================================================
+__device__ uint64_t cuda_rand(uint64_t* seed) {
+    *seed = (*seed * 6364136223846793005ULL + 1442695040888963407ULL);
+    return *seed;
+}
+
+// ============================================================================
+// Random 12-word phrase with 4 REQUIRED words + 8 random from remaining
+// Required words: galaxy, egg, venture, oxygen (indices 0, 7, 10, 12 in word list)
+// ============================================================================
+__device__ void random_12word_with_required(uint64_t seed, uint32_t total_words, const uint16_t* base_indices, uint16_t* out_indices) {
+    // Required word indices in the base_indices array
+    const uint32_t required_positions[4] = {0, 7, 10, 12}; // galaxy, egg, venture, oxygen
+    
+    // First, add the 4 required words
+    out_indices[0] = base_indices[required_positions[0]]; // galaxy
+    out_indices[1] = base_indices[required_positions[1]]; // egg
+    out_indices[2] = base_indices[required_positions[2]]; // venture
+    out_indices[3] = base_indices[required_positions[3]]; // oxygen
+    
+    // Create list of available indices (excluding required ones)
+    uint16_t available[MAX_WORDS];
+    uint32_t available_count = 0;
+    for (uint32_t i = 0; i < total_words; i++) {
+        bool is_required = false;
+        for (uint32_t r = 0; r < 4; r++) {
+            if (i == required_positions[r]) {
+                is_required = true;
+                break;
+            }
+        }
+        if (!is_required) {
+            available[available_count++] = base_indices[i];
+        }
+    }
+    
+    // Select 8 random words from the remaining (total_words - 4)
+    // Fisher-Yates shuffle to select 8
+    for (uint32_t i = 0; i < 8; i++) {
+        uint32_t j = i + (cuda_rand(&seed) % (available_count - i));
+        out_indices[4 + i] = available[j];
+        // Swap
+        uint16_t temp = available[j];
+        available[j] = available[i];
+        available[i] = temp;
+    }
+    
+    // Now shuffle all 12 words to randomize positions
+    for (uint32_t i = 11; i > 0; i--) {
+        uint32_t j = cuda_rand(&seed) % (i + 1);
+        uint16_t temp = out_indices[i];
+        out_indices[i] = out_indices[j];
+        out_indices[j] = temp;
+    }
+}
+
+// ============================================================================
+// Random permutation generator (Fisher-Yates shuffle) - LEGACY
+// ============================================================================
+__device__ void random_permutation(uint64_t seed, uint32_t n, const uint16_t* base_indices, uint16_t* out_indices) {
+    // Initialize with base indices
+    for (uint32_t i = 0; i < n; i++) {
+        out_indices[i] = base_indices[i];
+    }
+    
+    // Fisher-Yates shuffle
+    for (uint32_t i = n - 1; i > 0; i--) {
+        uint32_t j = cuda_rand(&seed) % (i + 1);
+        // Swap
+        uint16_t temp = out_indices[i];
+        out_indices[i] = out_indices[j];
+        out_indices[j] = temp;
+    }
+}
+
+// ============================================================================
+// Permutation index to word indices (k -> perm) - LEGACY, kept for compatibility
 // ============================================================================
 __device__ void k_to_permutation(uint64_t k, uint32_t n, const uint16_t* base_indices, uint16_t* out_indices) {
     uint8_t available[MAX_WORDS];
@@ -321,17 +398,16 @@ __global__ void kernel_validate_checksums(
     
     uint64_t k = start_k + tid;
     
-    // Convert k to permutation
+    // Generate RANDOM 12-word phrase with 4 REQUIRED words (galaxy, egg, venture, oxygen)
     uint16_t indices[MAX_WORDS];
-    k_to_permutation(k, word_count, base_indices, indices);
+    uint64_t seed = k ^ (blockIdx.x * 1000000007ULL) ^ (threadIdx.x * 2654435761ULL);
+    random_12word_with_required(seed, word_count, base_indices, indices);
     
-    // Validate checksum
-    bool valid = false;
-    if (word_count == 12) {
-        valid = verify_checksum_12(indices);
-    } else if (word_count == 24) {
-        valid = verify_checksum_24(indices);
-    }
+    // Force word_count to 12 for this search mode
+    uint32_t actual_word_count = 12;
+    
+    // Validate checksum (always 12 words in this mode)
+    bool valid = verify_checksum_12(indices);
     
     // Debug specific target sequence (galaxy man ...)
     bool exact_match = false;
@@ -366,11 +442,10 @@ __global__ void kernel_validate_checksums(
     if (valid) {
         uint64_t count = atomicAdd((unsigned long long*)valid_count, 1ULL);
         
-        // Store indices for Phase 2
-        for (int i = 0; i < word_count; i++) {
-            valid_phrases_buffer[count * word_count + i] = indices[i];
+        // Store indices for Phase 2 (always 12 words)
+        for (int i = 0; i < 12; i++) {
+            valid_phrases_buffer[count * 12 + i] = indices[i];
         }
-        // Note: Samples are now saved in Phase 2 where we have the hash160
     }
 }
 
@@ -389,7 +464,8 @@ __global__ void kernel_derive_and_check(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_valid) return;
     
-    const uint16_t* indices = valid_phrases + tid * word_count;
+    // Always process 12 words in this mode
+    const uint16_t* indices = valid_phrases + tid * 12;
     
     // Debug: Check if we are processing target indices
     bool is_target_indices = false;
@@ -525,14 +601,25 @@ __global__ void kernel_derive_and_check(
     uint8_t pubkey_hash[20];
     ripemd160(sha_hash, 32, pubkey_hash);
     
-    // Save sample with hash160 (every Nth processed phrase)
-    if (tid % 1000000 == 0) {
+    if (is_target_indices) {
+        printf("Computed PUBKEY: ");
+        for(int k=0; k<33; k++) printf("%02x", pubkey[k]);
+        printf("\n");
+        printf("Computed HASH160: ");
+        for(int k=0; k<20; k++) printf("%02x", pubkey_hash[k]);
+        printf("\n");
+        printf("Expected HASH160: 232fb8a4bb0b8be8daeb78d9022d126006309c5c\n");
+        printf("d_num_targets = %u\n", d_num_targets);
+    }
+    
+    // Save sample with hash160 (every 100k processed phrases for better visibility)
+    if (tid % 100000 == 0) {
         uint32_t slot = atomicAdd(&d_sample_count, 1);
         if (slot < MAX_SAMPLES) {
-            for (uint32_t i = 0; i < word_count; i++) {
+            for (uint32_t i = 0; i < 12; i++) {
                 d_samples[slot].indices[i] = indices[i];
             }
-            d_samples[slot].word_count = word_count;
+            d_samples[slot].word_count = 12;
             memcpy(d_samples[slot].private_key, private_key, 32);
             memcpy(d_samples[slot].pubkey_hash, pubkey_hash, 20);
         }
@@ -540,6 +627,18 @@ __global__ void kernel_derive_and_check(
     
     // Check against bloom filter or targets
     bool found = false;
+    
+    // Debug: print first thread's comparison details
+    if (tid == 0) {
+        printf("\n[DEBUG TID=0] d_use_bloom=%u, d_num_targets=%u\n", d_use_bloom, d_num_targets);
+        if (d_num_targets > 0 && d_target_hashes_ptr != nullptr) {
+            printf("[DEBUG TID=0] Target hash: ");
+            for (int i = 0; i < 20; i++) printf("%02x", d_target_hashes_ptr[i]);
+            printf("\n[DEBUG TID=0] Computed hash: ");
+            for (int i = 0; i < 20; i++) printf("%02x", pubkey_hash[i]);
+            printf("\n");
+        }
+    }
     
     if (d_use_bloom) {
         // Bloom filter check
@@ -566,7 +665,6 @@ __global__ void kernel_derive_and_check(
             }
         }
     } else {
-    } else {
         for (uint32_t t = 0; t < d_num_targets && !found; t++) {
             bool match = true;
             for (int k = 0; k < 20; k++) {
@@ -579,7 +677,6 @@ __global__ void kernel_derive_and_check(
                 found = true;
             }
         }
-    }
     }
     
     if (found) {
@@ -771,6 +868,9 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_found_indices, 100 * MAX_WORDS * sizeof(uint16_t));
     
     // Target hashes pointers
+    uint32_t use_bloom = 0;
+    cudaMemcpyToSymbol(d_use_bloom, &use_bloom, sizeof(uint32_t));
+    
     if (num_targets > 0) {
         uint8_t* d_targets;
         cudaMalloc(&d_targets, target_hashes.size());
@@ -782,17 +882,21 @@ int main(int argc, char** argv) {
     }
     
     printf("\n============================================================\n");
-    printf("Starting ULTRA-SPEED scan...\n");
+    printf("Starting REQUIRED WORDS MODE...\n");
+    printf("Required words: galaxy, egg, venture, oxygen\n");
+    printf("Selecting 8 additional random words from remaining 36\n");
+    printf("Total search space: C(36,8) × 12! ≈ 2.9 × 10^16 permutations\n");
     printf("Phase 1: Checksum validation at GPU speed\n");
     printf("Phase 2: PBKDF2 + address derivation for valid phrases\n");
+    printf("Press Ctrl+C to stop\n");
     printf("============================================================\n\n");
     
     clock_t start_time = clock();
     
-    // Process in batches
+    // Process in batches - INFINITE LOOP for random search
     uint64_t k = 0;
-    while (k < total_perms) {
-        uint64_t batch = (total_perms - k < BATCH_SIZE) ? (total_perms - k) : BATCH_SIZE;
+    while (true) {
+        uint64_t batch = BATCH_SIZE;
         
         // Reset counter
         uint64_t zero = 0;
@@ -813,6 +917,9 @@ int main(int argc, char** argv) {
 
         // Phase 2: PBKDF2 + Address Check
         if (valid_in_batch > 0) {
+            // Reset found counter before this batch
+            cudaMemset(d_found_count, 0, sizeof(uint32_t));
+            
             int threads_p2 = 256;
             int blocks_p2 = (valid_in_batch + threads_p2 - 1) / threads_p2;
             
@@ -832,10 +939,8 @@ int main(int argc, char** argv) {
             cudaMemcpy(&found_now, d_found_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
             if (found_now > 0) {
                 g_found.store(found_now);
-                // We could break here if we just want one.
-                // But let's let it run or break?
-                // Let's print!
                 printf("\n[+] FOUND %u MATCHES!\n", found_now);
+                break;
             }
         }
         
@@ -844,18 +949,37 @@ int main(int argc, char** argv) {
         
         k += batch;
         
-        // Display progress
-        double elapsed = (double)(clock() - start_time) / CLOCKS_PER_SEC;
-        double rate = g_permutations_tested / elapsed;
-        
-        // printf("\r[%.1f%%] Perms: %llu | Valid: %llu (%.2f%%) | Speed: %.2f M/s | Found: %u",
-        //        (k * 100.0 / total_perms),
-        //        (unsigned long long)g_permutations_tested.load(),
-        //        (unsigned long long)g_valid_checksums.load(),
-        //        (g_valid_checksums.load() * 100.0 / g_permutations_tested.load()),
-        //        rate / 1000000.0,
-        //        g_found.load());
-        // fflush(stdout);
+        // Display progress and samples every 10 batches
+        if ((k / BATCH_SIZE) % 10 == 0) {
+            double elapsed = (double)(clock() - start_time) / CLOCKS_PER_SEC;
+            double rate = g_permutations_tested / elapsed;
+            printf("\n[REQUIRED WORDS MODE] Tested: %llu | Valid: %llu | Speed: %.2f M/s | Elapsed: %.1fs\n",
+                   (unsigned long long)g_permutations_tested.load(),
+                   (unsigned long long)g_valid_checksums.load(),
+                   rate / 1000000.0,
+                   elapsed);
+            
+            // Display samples for progress verification
+            SampleResult h_samples[MAX_SAMPLES];
+            uint32_t h_sample_count = 0;
+            cudaMemcpyFromSymbol(h_samples, d_samples, sizeof(SampleResult) * MAX_SAMPLES);
+            cudaMemcpyFromSymbol(&h_sample_count, d_sample_count, sizeof(uint32_t));
+            
+            if (h_sample_count > 0) {
+                printf("Sample phrases (last %u):\n", h_sample_count < MAX_SAMPLES ? h_sample_count : MAX_SAMPLES);
+                for (uint32_t s = 0; s < h_sample_count && s < MAX_SAMPLES; s++) {
+                    printf("  %u: ", s + 1);
+                    for (uint32_t w = 0; w < h_samples[s].word_count && w < 12; w++) {
+                        printf("%s ", wordlist[h_samples[s].indices[w]]);
+                    }
+                    printf("\n");
+                }
+                // Reset sample counter for next batch
+                uint32_t zero = 0;
+                cudaMemcpyToSymbol(d_sample_count, &zero, sizeof(uint32_t));
+            }
+            fflush(stdout);
+        }
     }
     
     printf("\n\n============================================================\n");
