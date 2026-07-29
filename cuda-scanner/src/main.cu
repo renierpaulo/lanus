@@ -28,6 +28,9 @@
 #include "base58.cuh"
 #include "bip39.cuh"
 #include "pbkdf2_opt.cuh"
+#include "sha512_opt.cuh"
+#include "pbkdf2_fast.cuh"
+#include "secp256k1_fast.cuh"
 
 
 // ============================================================================
@@ -99,7 +102,7 @@ __device__ void derive_child_key(
         memcpy(data + 1, parent_key, 32);
     } else {
         uint8_t pubkey[33];
-        secp256k1_get_pubkey_compressed(parent_key, pubkey);
+        secp256k1_pubkey_fast(parent_key, pubkey);
         memcpy(data, pubkey, 33);
     }
     
@@ -114,7 +117,7 @@ __device__ void derive_child_key(
         printf("\n");
     }
     
-    hmac_sha512(parent_chaincode, 32, data, 37, I);
+    hmac_sha512_fast(parent_chaincode, 32, data, 37, I);
     
     if (debug) {
         printf("DEBUG IL: ");
@@ -409,34 +412,6 @@ __global__ void kernel_validate_checksums(
     // Validate checksum (always 12 words in this mode)
     bool valid = verify_checksum_12(indices);
     
-    // Debug specific target sequence (galaxy man ...)
-    bool exact_match = false;
-    if (word_count == 12) {
-        uint16_t expected[] = {759, 1078, 213, 623, 521, 319, 416, 302, 566, 1104, 191, 1666};
-        exact_match = true;
-        for(int i=0; i<12; i++) {
-             if (indices[i] != expected[i]) {
-                 exact_match = false;
-                 break;
-             }
-        }
-    }
-    
-    if (exact_match) {
-         printf("\n!!! FOUND EXACT TARGET AT K=%llu !!!\n", (unsigned long long)k);
-         printf("Indices: ");
-         for(int i=0; i<word_count; i++) printf("%d ", indices[i]);
-         printf("\n");
-         printf("Valid Checksum: %d\n", valid);
-         if (!valid) printf("WARNING: CHECKSUM FAILED FOR TARGET!\n");
-    }
-    
-    if (k == 0) {
-        printf("\nK=0 GENERATED INDICES: ");
-        for(int i=0; i<word_count; i++) printf("%d ", indices[i]);
-        printf("\n");
-    }
-    
     valid_flags[tid] = valid ? 1 : 0;
     
     if (valid) {
@@ -467,18 +442,7 @@ __global__ void kernel_derive_and_check(
     // Always process 12 words in this mode
     const uint16_t* indices = valid_phrases + tid * 12;
     
-    // Debug: Check if we are processing target indices
-    bool is_target_indices = false;
-    if (word_count == 12) {
-        uint16_t expected[] = {759, 1078, 213, 623, 521, 319, 416, 302, 566, 1104, 191, 1666};
-        is_target_indices = true;
-        for(int i=0; i<12; i++) {
-             if (indices[i] != expected[i]) {
-                 is_target_indices = false;
-                 break;
-             }
-        }
-    }
+    const bool is_target_indices = false;
     
     // Build mnemonic string
     uint8_t mnemonic[256];
@@ -515,7 +479,7 @@ __global__ void kernel_derive_and_check(
     
     // BIP39: PBKDF2(password=mnemonic, salt="mnemonic", iterations=2048)
     // Pass mnemonic directly with its length
-    pbkdf2_sha512_mnemonic(mnemonic, mnem_len, (const uint8_t*)salt, 8, PBKDF2_ITERATIONS, seed);
+    pbkdf2_sha512_mnemonic_fast(mnemonic, mnem_len, PBKDF2_ITERATIONS, seed);
 
     if (is_target_indices) {
          printf("\n");
@@ -544,7 +508,7 @@ __global__ void kernel_derive_and_check(
     {
         const char* key_str = "Bitcoin seed";
         uint8_t I[64];
-        hmac_sha512((const uint8_t*)key_str, 12, seed, 64, I);
+        hmac_sha512_fast((const uint8_t*)key_str, 12, seed, 64, I);
         memcpy(master_key, I, 32);
         memcpy(master_chaincode, I + 32, 32);
     }
@@ -593,7 +557,7 @@ __global__ void kernel_derive_and_check(
     
     // Get public key hash
     uint8_t pubkey[33];
-    secp256k1_get_pubkey_compressed(private_key, pubkey);
+    secp256k1_pubkey_fast(private_key, pubkey);
 
     uint8_t sha_hash[32];
     sha256(pubkey, 33, sha_hash);
@@ -628,17 +592,6 @@ __global__ void kernel_derive_and_check(
     // Check against bloom filter or targets
     bool found = false;
     
-    // Debug: print first thread's comparison details
-    if (tid == 0) {
-        printf("\n[DEBUG TID=0] d_use_bloom=%u, d_num_targets=%u\n", d_use_bloom, d_num_targets);
-        if (d_num_targets > 0 && d_target_hashes_ptr != nullptr) {
-            printf("[DEBUG TID=0] Target hash: ");
-            for (int i = 0; i < 20; i++) printf("%02x", d_target_hashes_ptr[i]);
-            printf("\n[DEBUG TID=0] Computed hash: ");
-            for (int i = 0; i < 20; i++) printf("%02x", pubkey_hash[i]);
-            printf("\n");
-        }
-    }
     
     if (d_use_bloom) {
         // Bloom filter check
@@ -883,9 +836,9 @@ int main(int argc, char** argv) {
     
     printf("\n============================================================\n");
     printf("Starting REQUIRED WORDS MODE...\n");
-    printf("Required words: galaxy, egg, venture, oxygen\n");
-    printf("Selecting 8 additional random words from remaining 36\n");
-    printf("Total search space: C(36,8) × 12! ≈ 2.9 × 10^16 permutations\n");
+    printf("Words are read from the file given with -words\n");
+    printf("Pattern: 4 required + fill, see random_12word_with_required()\n");
+    printf("Edit random_12word_with_required() to customize the pattern\n");
     printf("Phase 1: Checksum validation at GPU speed\n");
     printf("Phase 2: PBKDF2 + address derivation for valid phrases\n");
     printf("Press Ctrl+C to stop\n");
@@ -940,6 +893,37 @@ int main(int argc, char** argv) {
             if (found_now > 0) {
                 g_found.store(found_now);
                 printf("\n[+] FOUND %u MATCHES!\n", found_now);
+
+                // O kernel guarda a frase e a chave; sem copiar de volta o
+                // resultado se perdia junto com a memoria da GPU.
+                uint32_t nshow = found_now > 100 ? 100 : found_now;
+                uint16_t h_fidx[100 * MAX_WORDS];
+                uint8_t  h_fkey[100 * 32];
+                cudaMemcpy(h_fidx, d_found_indices, (size_t)nshow * MAX_WORDS * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_fkey, d_found_privkeys, (size_t)nshow * 32, cudaMemcpyDeviceToHost);
+
+                FILE* ff = fopen("FOUND.txt", "a");
+                for (uint32_t s = 0; s < nshow; s++) {
+                    char phrase[512]; int pl = 0;
+                    for (uint32_t w = 0; w < 12; w++) {
+                        const char* wd = wordlist[h_fidx[s * word_count + w]];
+                        if (w) phrase[pl++] = ' ';
+                        for (int c = 0; wd[c]; c++) phrase[pl++] = wd[c];
+                    }
+                    phrase[pl] = 0;
+
+                    char keyhex[80];
+                    for (int b = 0; b < 32; b++) sprintf(keyhex + b * 2, "%02x", h_fkey[s * 32 + b]);
+                    keyhex[64] = 0;
+
+                    printf("\n*** FRASE ENCONTRADA ***\n");
+                    printf("  Frase   : %s\n", phrase);
+                    printf("  Privkey : %s\n", keyhex);
+                    printf("  Caminho : m/44'/0'/0'/0/0\n");
+                    if (ff) fprintf(ff, "%s\t%s\n", phrase, keyhex);
+                }
+                if (ff) { fclose(ff); printf("\n  (tambem salvo em FOUND.txt)\n"); }
+                fflush(stdout);
                 break;
             }
         }
