@@ -6,3 +6,10 @@ btc1.txt
 *.exp
 build/
 .vscode/
+
+# variantes locais de busca e resultados (config pessoal - nao versionar)
+cuda-scanner/src/main_search*.cu
+cuda-scanner/src/main_*needle*.cu
+cuda-scanner/src/main_n*.cu
+FOUND.txt
+words22.txt

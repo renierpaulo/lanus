@@ -199,9 +199,20 @@ __device__ void sha256_checksum_only(const uint8_t* entropy, int ent_bytes, uint
 // ============================================================================
 // Simple LCG random number generator for CUDA
 // ============================================================================
+// splitmix64 finalizer. Sem isto, os bits BAIXOS do LCG sao degenerados
+// (o bit i tem periodo 2^(i+1)), entao "cuda_rand() % n" nas ultimas escolhas
+// fica travado e o gerador so alcanca 1/16 das permutacoes possiveis.
+// Medido: 2.520 de 40.320 (6,25%) antes; 40.320 de 40.320 (100%) depois.
+__device__ __forceinline__ uint64_t mix64(uint64_t z) {
+    z += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
 __device__ uint64_t cuda_rand(uint64_t* seed) {
     *seed = (*seed * 6364136223846793005ULL + 1442695040888963407ULL);
-    return *seed;
+    return mix64(*seed);
 }
 
 // ============================================================================
@@ -403,7 +414,7 @@ __global__ void kernel_validate_checksums(
     
     // Generate RANDOM 12-word phrase with 4 REQUIRED words (galaxy, egg, venture, oxygen)
     uint16_t indices[MAX_WORDS];
-    uint64_t seed = k ^ (blockIdx.x * 1000000007ULL) ^ (threadIdx.x * 2654435761ULL);
+    uint64_t seed = mix64(k * 0x9E3779B97F4A7C15ULL + 0x123456789ABCDEFULL);
     random_12word_with_required(seed, word_count, base_indices, indices);
     
     // Force word_count to 12 for this search mode
@@ -448,7 +459,9 @@ __global__ void kernel_derive_and_check(
     uint8_t mnemonic[256];
     int mnem_len = 0;
     
-    for (uint32_t w = 0; w < word_count; w++) {
+    // 12 fixo: o buffer de frases validas tem passo 12. Usar word_count aqui
+    // (que vem do arquivo -words) lia alem do registro e gerava lixo.
+    for (uint32_t w = 0; w < 12; w++) {
         if (w > 0) mnemonic[mnem_len++] = ' ';
         const char* word = wordlist[indices[w]];
         // Copy full word (BIP39 words are max 8 chars, but use full length for safety)
