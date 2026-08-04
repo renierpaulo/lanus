@@ -19,6 +19,61 @@
 #include <stdint.h>
 #include "sha512_opt.cuh"
 
+// Variante que recebe a chave JA empacotada em 16 palavras de 64 bits
+// (big-endian, zero-padded ate 128 bytes). Evita montar a frase como bytes
+// em memoria local so para reempacotar aqui.
+// O comprimento nao e necessario: a chave do HMAC e o bloco de 128 bytes
+// completo, e a mensagem e sempre "mnemonic"||INT32BE(1).
+__device__ void pbkdf2_bip39_packed(const uint64_t* kw, uint32_t iterations,
+                                    uint8_t* output_64bytes) {
+    uint64_t blk[16], inner_pre[8], outer_pre[8];
+
+    #pragma unroll
+    for (int i = 0; i < 16; i++) blk[i] = kw[i] ^ 0x3636363636363636ULL;
+    sha512_init_opt(inner_pre);
+    sha512_compress_opt(inner_pre, blk);
+
+    #pragma unroll
+    for (int i = 0; i < 16; i++) blk[i] = kw[i] ^ 0x5c5c5c5c5c5c5c5cULL;
+    sha512_init_opt(outer_pre);
+    sha512_compress_opt(outer_pre, blk);
+
+    uint64_t st[8], U[8], T[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) st[i] = inner_pre[i];
+
+    blk[0] = 0x6d6e656d6f6e6963ULL;   // "mnemonic"
+    blk[1] = 0x0000000180000000ULL;   // INT32BE(1) + 0x80
+    #pragma unroll
+    for (int i = 2; i < 15; i++) blk[i] = 0;
+    blk[15] = 0x460;
+    sha512_compress_opt(st, blk);
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) U[i] = outer_pre[i];
+    sha512_block64_pad192_opt(U, st);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) T[i] = U[i];
+
+    for (uint32_t it = 1; it < iterations; it++) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) st[i] = inner_pre[i];
+        sha512_block64_pad192_opt(st, U);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) U[i] = outer_pre[i];
+        sha512_block64_pad192_opt(U, st);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) T[i] ^= U[i];
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint64_t x = T[i];
+        #pragma unroll
+        for (int b = 0; b < 8; b++) output_64bytes[i*8+b] = (uint8_t)(x >> (56 - 8*b));
+    }
+}
+
 __device__ void pbkdf2_sha512_mnemonic_fast(
     const uint8_t* password, uint32_t password_len,
     uint32_t iterations,

@@ -82,6 +82,18 @@ __global__ void k_coverage(uint32_t* hits) {
     atomicOr(&hits[rank >> 5], 1u << (rank & 31));
 }
 
+// Assinatura de 64 bits da k-esima frase, para detectar colisoes no host.
+__global__ void k_enum_sig(const uint16_t* base, uint32_t total_words,
+                           uint32_t nsamples, uint64_t* out) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nsamples) return;
+    uint16_t ph[12];
+    kth_phrase((uint64_t)tid, total_words, base, ph);
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < 12; i++) { h ^= ph[i]; h *= 1099511628211ULL; }
+    out[tid] = h;
+}
+
 int main() {
     char wl[2048][16];
     FILE* f = fopen("wordlist.txt", "r");
@@ -148,6 +160,52 @@ int main() {
     printf("  %s\n", cov > 99.0 ? "OK (RNG uniforme)"
                                 : "<<< FALHOU: RNG degenerado, parte do espaco e inalcancavel");
     if (cov <= 99.0) ok = 0;
+
+    // ---------------- TESTE 3 ----------------
+    // kth_phrase tem que ser BIJETIVO: k distintos -> frases distintas.
+    // Um off-by-one no unranking faria a varredura exaustiva pular parte do
+    // espaco em silencio -- o mesmo tipo de falha do bug do RNG.
+    printf("\n=== TESTE 3: bijecao da enumeracao exaustiva ===\n");
+    {
+        const uint32_t NW = 20, NREQ = 4;      // 4 obrigatorias + 8 de 16
+        uint32_t rc = NREQ;
+        cudaMemcpyToSymbol(d_required_count, &rc, sizeof(uint32_t));
+
+        static uint64_t hb[41][13];
+        for (int a = 0; a <= 40; a++)
+            for (int b = 0; b <= 12; b++)
+                hb[a][b] = (b == 0) ? 1ULL : (b > a ? 0ULL : hb[a-1][b-1] + hb[a-1][b]);
+        cudaMemcpyToSymbol(d_binom, hb, sizeof(hb));
+
+        uint64_t hf[25]; hf[0] = 1;
+        for (int i = 1; i <= 24; i++) hf[i] = hf[i-1] * i;
+        cudaMemcpyToSymbol(d_factorials, hf, sizeof(hf));
+
+        uint16_t hb_idx[MAX_WORDS];
+        for (uint32_t i = 0; i < NW; i++) hb_idx[i] = (uint16_t)(100 + i);
+        uint16_t* d_b; cudaMalloc(&d_b, MAX_WORDS * 2);
+        cudaMemcpy(d_b, hb_idx, MAX_WORDS * 2, cudaMemcpyHostToDevice);
+
+        const uint32_t NS = 1u << 20;          // 1M valores de k consecutivos
+        uint64_t* d_sig; cudaMalloc(&d_sig, (size_t)NS * 8);
+        k_enum_sig<<<(NS + 255) / 256, 256>>>(d_b, NW, NS, d_sig);
+        if (cudaDeviceSynchronize() != cudaSuccess) { printf("  ERRO CUDA\n"); ok = 0; }
+
+        uint64_t* hs = (uint64_t*)malloc((size_t)NS * 8);
+        cudaMemcpy(hs, d_sig, (size_t)NS * 8, cudaMemcpyDeviceToHost);
+        qsort(hs, NS, 8, [](const void* a, const void* b) {
+            uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+            return x < y ? -1 : (x > y ? 1 : 0);
+        });
+        uint32_t dup = 0;
+        for (uint32_t i = 1; i < NS; i++) if (hs[i] == hs[i-1]) dup++;
+
+        printf("  %u valores de k -> %u frases, %u colisoes\n", NS, NS, dup);
+        printf("  %s\n", dup == 0 ? "OK (bijetivo)"
+                                  : "<<< FALHOU: enumeracao repete/pula frases");
+        if (dup) ok = 0;
+        free(hs); cudaFree(d_sig); cudaFree(d_b);
+    }
 
     printf("\n%s\n", ok ? "TODOS OS TESTES PASSARAM" : "!!! ALGUM TESTE FALHOU !!!");
     return ok ? 0 : 1;

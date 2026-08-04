@@ -141,25 +141,25 @@ __device__ void uint256_mod_sub(uint256_t* r, const uint256_t* a, const uint256_
     }
 }
 
-// Multiplicação 256x256 -> 512 bits (produto completo)
-// Multiplicação 256x256 -> 512 bits (produto completo)
-__device__ void uint256_mul_full(uint32_t* r, const uint256_t* a, const uint256_t* b) {
-    uint64_t acc = 0;
-    
+// Multiplicacao 256x256 -> 512 bits, schoolbook por linhas, SEM BRANCH.
+// t = a[i]*b[j] + r[i+j] + carry cabe exato em uint64
+// (pior caso (2^32-1)^2 + 2*(2^32-1) = 2^64-1, folga zero).
+// A versao anterior fazia "if (acc < prev) extra_carry++" por termo (64 desvios)
+// e tinha limites de laco variaveis, o que impedia o unroll.
+__device__ __forceinline__ void uint256_mul_full(uint32_t* r, const uint256_t* a, const uint256_t* b) {
     #pragma unroll
-    for (int k = 0; k < 16; k++) {
-        uint32_t extra_carry = 0;
-        
-        for (int i = (k < 8 ? 0 : k - 7); i <= (k < 8 ? k : 7); i++) {
-            int j = k - i;
-            uint64_t prod = (uint64_t)a->d[i] * (uint64_t)b->d[j];
-            uint64_t prev_acc = acc;
-            acc += prod;
-            if (acc < prev_acc) extra_carry++;
+    for (int i = 0; i < 8; i++) r[i] = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint32_t carry = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            uint64_t t = (uint64_t)a->d[i] * (uint64_t)b->d[j] + (uint64_t)r[i + j] + (uint64_t)carry;
+            r[i + j] = (uint32_t)t;
+            carry = (uint32_t)(t >> 32);
         }
-        r[k] = (uint32_t)acc;
-        acc >>= 32;
-        acc |= ((uint64_t)extra_carry << 32);
+        r[i + 8] = carry;
     }
 }
 
@@ -238,51 +238,62 @@ __device__ void secp256k1_reduce(uint256_t* r, const uint32_t* t) {
 }
 
 // Multiplicação modular OTIMIZADA usando redução especial do secp256k1
-__device__ void uint256_mod_mul(uint256_t* r, const uint256_t* a, const uint256_t* b, const uint256_t* m) {
-    uint32_t t[16] = {0};
+__device__ __forceinline__ void uint256_mod_mul(uint256_t* r, const uint256_t* a, const uint256_t* b, const uint256_t* m) {
+    uint32_t t[16];              // sem "= {0}": mul_full escreve as 16 palavras
     uint256_mul_full(t, a, b);
     secp256k1_reduce(r, t);
 }
 
-// Quadrado modular (mais rápido que mul quando a == b)
+// Quadrado modular SEM BRANCH: 36 multiplicacoes (28 fora da diagonal + 8
+// diagonais) em vez das 64 do schoolbook. Pesa: a inversao faz 255 quadrados
+// por chave publica, e sao 3 chaves por candidato.
+//   r = 2*sum_{i<j} a[i]a[j] B^(i+j)  +  sum_i a[i]^2 B^(2i)
 __device__ void uint256_mod_sqr(uint256_t* r, const uint256_t* a) {
-    uint32_t t[16] = {0};
-    uint64_t acc = 0;
-    
-    // Termos diagonais + 2 * termos cruzados
+    uint32_t t[16];
     #pragma unroll
-    for (int k = 0; k < 16; k++) {
-        uint32_t extra_carry = 0;
-        int start = (k < 8 ? 0 : k - 7);
-        int end = k / 2;
-        
-        for (int i = start; i <= end; i++) {
-            int j = k - i;
-            uint64_t prod = (uint64_t)a->d[i] * (uint64_t)a->d[j];
-            
-            if (i < j) {
-                // Accumulate 2 * prod
-                // prod * 2 might overflow 64 bits, carry is in MSB of prod
-                uint32_t msb = prod >> 63;
-                uint64_t double_prod = prod << 1;
-                
-                extra_carry += msb;
-                
-                uint64_t prev = acc;
-                acc += double_prod;
-                if (acc < prev) extra_carry++;
-            } else {
-                // Accumulate prod
-                uint64_t prev = acc;
-                acc += prod;
-                if (acc < prev) extra_carry++;
-            }
+    for (int i = 0; i < 16; i++) t[i] = 0;
+
+    // fora da diagonal
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint32_t carry = 0;
+        #pragma unroll
+        for (int j = i + 1; j < 8; j++) {
+            uint64_t x = (uint64_t)a->d[i] * (uint64_t)a->d[j] + (uint64_t)t[i + j] + (uint64_t)carry;
+            t[i + j] = (uint32_t)x;
+            carry = (uint32_t)(x >> 32);
         }
-        t[k] = (uint32_t)acc;
-        acc >>= 32;
-        acc |= ((uint64_t)extra_carry << 32);
+        // acumula (nao sobrescreve: linhas anteriores ja escreveram aqui)
+        uint64_t acc = (uint64_t)t[i + 8] + (uint64_t)carry;
+        t[i + 8] = (uint32_t)acc;
     }
-    
+
+    // dobra
+    {
+        uint32_t c = 0;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            uint32_t v = t[k];
+            t[k] = (v << 1) | c;
+            c = v >> 31;
+        }
+    }
+
+    // soma a diagonal
+    {
+        uint32_t c = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            uint64_t d = (uint64_t)a->d[i] * (uint64_t)a->d[i];
+            uint64_t x = (uint64_t)t[2*i] + (d & 0xFFFFFFFFULL) + (uint64_t)c;
+            t[2*i] = (uint32_t)x;
+            c = (uint32_t)(x >> 32);
+            x = (uint64_t)t[2*i + 1] + (d >> 32) + (uint64_t)c;
+            t[2*i + 1] = (uint32_t)x;
+            c = (uint32_t)(x >> 32);
+        }
+    }
+
     secp256k1_reduce(r, t);
 }
 

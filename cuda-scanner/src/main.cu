@@ -20,6 +20,7 @@
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 
 #include "sha256.cuh"
 #include "sha512.cuh"
@@ -47,6 +48,7 @@ std::atomic<uint64_t> g_permutations_tested(0);
 std::atomic<uint64_t> g_valid_checksums(0);
 std::atomic<uint64_t> g_addresses_checked(0);
 std::atomic<uint32_t> g_found(0);
+std::atomic<bool> g_stop(false);   // uma GPU achou -> todas param
 std::mutex g_print_mutex;
 
 // Sample storage for display
@@ -66,6 +68,10 @@ __device__ uint32_t d_sample_count = 0;
 // ============================================================================
 __constant__ uint16_t d_word_indices[MAX_WORDS];
 __constant__ uint32_t d_word_count;
+__constant__ uint32_t d_required_count;
+__constant__ uint32_t d_wild_count;      // palavras livres da lista de 2048
+__constant__ uint64_t d_binom[41][13];   // C(n,k), n<=40, k<=12
+#define PERM12 479001600ULL              // 12!
 __constant__ uint64_t d_factorials[25];
 
 // Bloom filter
@@ -219,50 +225,100 @@ __device__ uint64_t cuda_rand(uint64_t* seed) {
 // Random 12-word phrase with 4 REQUIRED words + 8 random from remaining
 // Required words: galaxy, egg, venture, oxygen (indices 0, 7, 10, 12 in word list)
 // ============================================================================
+// Monta uma frase de 12 palavras:
+//   - as d_required_count primeiras palavras do arquivo -words entram SEMPRE;
+//   - as (12 - d_required_count) restantes sao sorteadas do resto do arquivo;
+//   - por fim as 12 posicoes sao embaralhadas (ordem desconhecida).
+// Tudo vem do arquivo: para mudar a busca basta editar o .txt e usar -req N,
+// sem recompilar.
 __device__ void random_12word_with_required(uint64_t seed, uint32_t total_words, const uint16_t* base_indices, uint16_t* out_indices) {
-    // Required word indices in the base_indices array
-    const uint32_t required_positions[4] = {0, 7, 10, 12}; // galaxy, egg, venture, oxygen
-    
-    // First, add the 4 required words
-    out_indices[0] = base_indices[required_positions[0]]; // galaxy
-    out_indices[1] = base_indices[required_positions[1]]; // egg
-    out_indices[2] = base_indices[required_positions[2]]; // venture
-    out_indices[3] = base_indices[required_positions[3]]; // oxygen
-    
-    // Create list of available indices (excluding required ones)
-    uint16_t available[MAX_WORDS];
-    uint32_t available_count = 0;
-    for (uint32_t i = 0; i < total_words; i++) {
-        bool is_required = false;
-        for (uint32_t r = 0; r < 4; r++) {
-            if (i == required_positions[r]) {
-                is_required = true;
-                break;
-            }
-        }
-        if (!is_required) {
-            available[available_count++] = base_indices[i];
-        }
+    const uint32_t nreq  = d_required_count;
+    const uint32_t nwild = d_wild_count;      // -wild N: livres das 2048
+
+    for (uint32_t i = 0; i < nreq; i++) out_indices[i] = base_indices[i];
+
+    // curingas: qualquer palavra da lista BIP39 completa
+    for (uint32_t i = 0; i < nwild; i++)
+        out_indices[nreq + i] = (uint16_t)(cuda_rand(&seed) % 2048u);
+
+    uint16_t pool[MAX_WORDS];
+    uint32_t navail = total_words - nreq;
+    for (uint32_t i = 0; i < navail; i++) pool[i] = base_indices[nreq + i];
+
+    const uint32_t nchoose = 12u - nreq - nwild;
+    for (uint32_t i = 0; i < nchoose; i++) {
+        uint32_t j = cuda_rand(&seed) % navail;
+        out_indices[nreq + nwild + i] = pool[j];
+        pool[j] = pool[navail - 1];
+        navail--;
     }
-    
-    // Select 8 random words from the remaining (total_words - 4)
-    // Fisher-Yates shuffle to select 8
-    for (uint32_t i = 0; i < 8; i++) {
-        uint32_t j = i + (cuda_rand(&seed) % (available_count - i));
-        out_indices[4 + i] = available[j];
-        // Swap
-        uint16_t temp = available[j];
-        available[j] = available[i];
-        available[i] = temp;
-    }
-    
-    // Now shuffle all 12 words to randomize positions
-    for (uint32_t i = 11; i > 0; i--) {
-        uint32_t j = cuda_rand(&seed) % (i + 1);
-        uint16_t temp = out_indices[i];
+
+    for (int i = 11; i > 0; i--) {
+        uint32_t j = cuda_rand(&seed) % (uint32_t)(i + 1);
+        uint16_t t = out_indices[i];
         out_indices[i] = out_indices[j];
-        out_indices[j] = temp;
+        out_indices[j] = t;
     }
+}
+
+// ============================================================================
+// ENUMERACAO EXAUSTIVA: k -> frase, bijetivo sobre C(P,K) * 12!
+// ============================================================================
+__device__ void unrank_combo(uint64_t idx, uint32_t nn, uint32_t kk, uint8_t* out) {
+    uint64_t x = d_binom[nn][kk] - 1 - idx;
+    int a = (int)nn, b = (int)kk;
+    for (uint32_t i = 0; i < kk; i++) {
+        a--;
+        while (a > 0 && d_binom[a][b] > x) a--;
+        x -= d_binom[a][b];
+        out[i] = (uint8_t)((int)nn - 1 - a);
+        b--;
+    }
+}
+
+__device__ void unrank_perm12(uint64_t idx, const uint16_t* items, uint16_t* out) {
+    uint16_t pool[12];
+    #pragma unroll
+    for (int i = 0; i < 12; i++) pool[i] = items[i];
+    int navail = 12;
+    for (int i = 12; i > 0; i--) {
+        uint64_t f = d_factorials[i - 1];
+        uint32_t j = (uint32_t)(idx / f);
+        idx -= (uint64_t)j * f;
+        out[12 - i] = pool[j];
+        for (int m = j; m < navail - 1; m++) pool[m] = pool[m + 1];
+        navail--;
+    }
+}
+
+// k-esima frase do espaco de busca (sem repetir e sem pular).
+__device__ void kth_phrase(uint64_t k, uint32_t total_words,
+                           const uint16_t* base_indices, uint16_t* out_indices) {
+    const uint32_t nreq  = d_required_count;
+    const uint32_t nwild = d_wild_count;
+    const uint32_t K = 12u - nreq - nwild;
+    const uint32_t Psz = total_words - nreq;
+
+    uint64_t rest      = k / PERM12;          // (combo, curingas)
+    uint64_t perm_idx  = k - rest * PERM12;
+
+    // desempacota os curingas (base 2048), depois a combinacao
+    uint16_t wild[3];
+    for (uint32_t i = 0; i < nwild; i++) {
+        wild[i] = (uint16_t)(rest % 2048ULL);
+        rest /= 2048ULL;
+    }
+    uint64_t combo_idx = rest;
+
+    uint8_t sel[12];
+    unrank_combo(combo_idx, Psz, K, sel);
+
+    uint16_t doze[12];
+    for (uint32_t i = 0; i < nreq; i++)  doze[i] = base_indices[i];
+    for (uint32_t i = 0; i < nwild; i++) doze[nreq + i] = wild[i];
+    for (uint32_t i = 0; i < K; i++)     doze[nreq + nwild + i] = base_indices[nreq + sel[i]];
+
+    unrank_perm12(perm_idx, doze, out_indices);
 }
 
 // ============================================================================
@@ -401,6 +457,8 @@ __device__ bool verify_checksum_24(const uint16_t* indices) {
 __global__ void kernel_validate_checksums(
     uint64_t start_k,
     uint64_t batch_size,
+    uint32_t exhaustive,
+    uint64_t total_space,
     const uint16_t* base_indices,
     uint32_t word_count,
     uint8_t* valid_flags,
@@ -412,10 +470,15 @@ __global__ void kernel_validate_checksums(
     
     uint64_t k = start_k + tid;
     
-    // Generate RANDOM 12-word phrase with 4 REQUIRED words (galaxy, egg, venture, oxygen)
+    // Exaustivo: k -> frase (bijetivo). Aleatorio: sorteio com reposicao.
     uint16_t indices[MAX_WORDS];
-    uint64_t seed = mix64(k * 0x9E3779B97F4A7C15ULL + 0x123456789ABCDEFULL);
-    random_12word_with_required(seed, word_count, base_indices, indices);
+    if (exhaustive) {
+        if (k >= total_space) return;          // fim do espaco
+        kth_phrase(k, word_count, base_indices, indices);
+    } else {
+        uint64_t seed = mix64(k * 0x9E3779B97F4A7C15ULL + 0x123456789ABCDEFULL);
+        random_12word_with_required(seed, word_count, base_indices, indices);
+    }
     
     // Force word_count to 12 for this search mode
     uint32_t actual_word_count = 12;
@@ -431,6 +494,31 @@ __global__ void kernel_validate_checksums(
         // Store indices for Phase 2 (always 12 words)
         for (int i = 0; i < 12; i++) {
             valid_phrases_buffer[count * 12 + i] = indices[i];
+        }
+    }
+}
+
+// Monta as 12 palavras direto no formato do PBKDF2 (16 x uint64 big-endian,
+// zero-padded), sem passar por um array de bytes em memoria local.
+__device__ __forceinline__ void pack_mnemonic_words(
+    const uint16_t* indices, const char wl[2048][16], uint64_t* kw)
+{
+    #pragma unroll
+    for (int i = 0; i < 16; i++) kw[i] = 0;
+    uint32_t pos = 0;
+    #pragma unroll 1
+    for (int w = 0; w < 12; w++) {
+        if (w) {
+            kw[pos >> 3] |= (uint64_t)' ' << (56 - 8 * (pos & 7));
+            pos++;
+        }
+        const char* s = wl[indices[w]];
+        #pragma unroll 1
+        for (int c = 0; c < 16; c++) {
+            char ch = s[c];
+            if (!ch) break;
+            kw[pos >> 3] |= (uint64_t)(uint8_t)ch << (56 - 8 * (pos & 7));
+            pos++;
         }
     }
 }
@@ -453,59 +541,37 @@ __global__ void kernel_derive_and_check(
     // Always process 12 words in this mode
     const uint16_t* indices = valid_phrases + tid * 12;
     
-    const bool is_target_indices = false;
     
-    // Build mnemonic string
-    uint8_t mnemonic[256];
-    int mnem_len = 0;
+    // Monta a frase direto no formato do PBKDF2 (16 x uint64): sai o array de
+    // 256 bytes em memoria local E o reempacotamento byte->uint64 do pbkdf2.
+    uint64_t kw[16];
+    pack_mnemonic_words(indices, wordlist, kw);
     
-    // 12 fixo: o buffer de frases validas tem passo 12. Usar word_count aqui
-    // (que vem do arquivo -words) lia alem do registro e gerava lixo.
-    for (uint32_t w = 0; w < 12; w++) {
-        if (w > 0) mnemonic[mnem_len++] = ' ';
-        const char* word = wordlist[indices[w]];
-        // Copy full word (BIP39 words are max 8 chars, but use full length for safety)
-        for (int i = 0; word[i] && i < 16; i++) {
-            mnemonic[mnem_len++] = word[i];
-        }
-    }
+
     
-    if (is_target_indices) {
-         // Found target permutation
-         printf("\n!!! PHASE 2: PROCESSING TARGET INDICES (TID=%llu) !!!\n", (unsigned long long)tid);
-    }
-    
-    // Debug: print first mnemonic
+    // Debug: imprime a primeira frase (kw esta empacotado em uint64 big-endian)
     #if DEBUG_MODE
     if (tid == 0) {
-        mnemonic[mnem_len] = 0;
-        printf("[DEBUG] MNEMONIC: %s\n", (char*)mnemonic);
+        char dbg[129];
+        for (int i = 0; i < 16; i++)
+            for (int b = 0; b < 8; b++)
+                dbg[i*8+b] = (char)(kw[i] >> (56 - 8*b));
+        dbg[128] = 0;
+        printf("[DEBUG] MNEMONIC: %s\n", dbg);
         printf("[DEBUG] INDICES: ");
-        for(uint32_t w=0; w<word_count; w++) printf("%d ", indices[w]);
+        for (int w = 0; w < 12; w++) printf("%d ", indices[w]);
         printf("\n");
     }
     #endif
     
     // PBKDF2-SHA512 to derive seed
     uint8_t seed[64];
-    const char* salt = "mnemonic";
     
     // BIP39: PBKDF2(password=mnemonic, salt="mnemonic", iterations=2048)
     // Pass mnemonic directly with its length
-    pbkdf2_sha512_mnemonic_fast(mnemonic, mnem_len, PBKDF2_ITERATIONS, seed);
+    pbkdf2_bip39_packed(kw, PBKDF2_ITERATIONS, seed);
 
-    if (is_target_indices) {
-         printf("\n");
-         printf("Mnemonic length: %d bytes\n", mnem_len);
-         printf("Computed SEED: ");
-         for(int k=0; k<64; k++) printf("%02x", seed[k]);
-         printf("\n");
-         
-         // Expected seed for "galaxy man boy evil donkey child cross chair egg meat blood space"
-         // 4cd832a5c862ef5117870c15bdf792ed558499a2c81d8bd5c68f28bf0f66671b
-         // 76e6522d90fb4996cc29d1a7b37ccf0bcc8157dea21f5f065e89921841323ab8
-         printf("Expected SEED: 4cd832a5c862ef5117870c15bdf792ed558499a2c81d8bd5c68f28bf0f66671b76e6522d90fb4996cc29d1a7b37ccf0bcc8157dea21f5f065e89921841323ab8\n");
-    }
+
 
     
     #if DEBUG_MODE
@@ -526,14 +592,7 @@ __global__ void kernel_derive_and_check(
         memcpy(master_chaincode, I + 32, 32);
     }
     
-    if (is_target_indices) {
-         printf("Computed MASTER KEY: ");
-         for(int k=0; k<32; k++) printf("%02x", master_key[k]);
-         printf("\n");
-         printf("Computed CHAIN CODE: ");
-         for(int k=0; k<32; k++) printf("%02x", master_chaincode[k]);
-         printf("\n");
-    }
+
     
     #if DEBUG_MODE
     if (tid == 0) {
@@ -578,16 +637,7 @@ __global__ void kernel_derive_and_check(
     uint8_t pubkey_hash[20];
     ripemd160(sha_hash, 32, pubkey_hash);
     
-    if (is_target_indices) {
-        printf("Computed PUBKEY: ");
-        for(int k=0; k<33; k++) printf("%02x", pubkey[k]);
-        printf("\n");
-        printf("Computed HASH160: ");
-        for(int k=0; k<20; k++) printf("%02x", pubkey_hash[k]);
-        printf("\n");
-        printf("Expected HASH160: 232fb8a4bb0b8be8daeb78d9022d126006309c5c\n");
-        printf("d_num_targets = %u\n", d_num_targets);
-    }
+
     
     // Save sample with hash160 (every 100k processed phrases for better visibility)
     if (tid % 100000 == 0) {
@@ -718,13 +768,32 @@ uint64_t factorial(int n) {
 // ============================================================================
 // Main
 // ============================================================================
+// Checa uma chamada CUDA e aborta dizendo onde falhou. O codigo original nao
+// checava nada, entao qualquer falha de setup virava um erro fantasma no kernel.
+#define CUDA_CHECK(call) do {                                                  \
+    cudaError_t _e = (call);                                                   \
+    if (_e != cudaSuccess) {                                                   \
+        printf("\n[X] CUDA falhou em %s:%d -> %s\n    chamada: %s\n",          \
+               __FILE__, __LINE__, cudaGetErrorString(_e), #call);             \
+        return 1;                                                              \
+    }                                                                          \
+} while (0)
+
 int main(int argc, char** argv) {
     printf("============================================================\n");
     printf("  BIP39 CUDA Scanner v6.0 - ULTRA SPEED MODE\n");
     printf("============================================================\n");
     
     if (argc < 3) {
-        printf("Usage: %s -words <words.txt> -a <addresses.txt> [--bloom <MB>]\n", argv[0]);
+        printf("Usage: %s -words <words.txt> -a <addresses.txt> [-req N] [--bloom <MB>]\n", argv[0]);
+        printf("  -req N : as N primeiras palavras do arquivo sao OBRIGATORIAS (default 4)\n");
+        printf("  -gpus N: usar N GPUs (default: todas as detectadas)\n");
+        printf("  -wild N: N palavras LIVRES da lista BIP39 completa (2048)\n");
+        printf("           cada curinga multiplica o espaco por 2048 (max 3)\n");
+        printf("  -exh   : varredura EXAUSTIVA (cobertura garantida, ~2x mais rapido\n");
+        printf("           que o sorteio aleatorio no tempo esperado)\n");
+        printf("  -resume K : retoma a varredura exaustiva a partir de k=K\n");
+        printf("           as (12-N) restantes sao sorteadas do resto do arquivo\n");
         return 1;
     }
 
@@ -735,11 +804,21 @@ int main(int argc, char** argv) {
     const char* words_file = NULL;
     const char* addr_file = NULL;
     int bloom_mb = 0;
+    int required_count = 4;
+    int exhaustive = 0;
+    int n_gpus = 0;   // 0 = usar todas as detectadas
+    int wild_count = 0;   // -wild N: N palavras livres das 2048
+    unsigned long long resume_k = 0;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-words") == 0 && i + 1 < argc) words_file = argv[++i];
         else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) addr_file = argv[++i];
         else if (strcmp(argv[i], "--bloom") == 0 && i + 1 < argc) bloom_mb = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-req") == 0 && i + 1 < argc) required_count = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-exh") == 0) exhaustive = 1;
+        else if (strcmp(argv[i], "-gpus") == 0 && i + 1 < argc) n_gpus = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-wild") == 0 && i + 1 < argc) wild_count = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-resume") == 0 && i + 1 < argc) resume_k = strtoull(argv[++i], NULL, 10);
     }
     
     if (!words_file || !addr_file) {
@@ -780,7 +859,63 @@ int main(int argc, char** argv) {
     uint32_t word_count;
     load_target_words(words_file, wordlist, h_word_indices, &word_count);
     
+    if (required_count < 0 || required_count > 12) {
+        printf("Error: -req deve estar entre 0 e 12 (recebido %d)\n", required_count);
+        return 1;
+    }
+    if (word_count < 12) {
+        printf("Error: o arquivo -words precisa de pelo menos 12 palavras (tem %u)\n", word_count);
+        return 1;
+    }
+    if ((uint32_t)required_count > word_count) {
+        printf("Error: -req %d maior que o total de palavras (%u)\n", required_count, word_count);
+        return 1;
+    }
+    if (wild_count < 0 || wild_count > 3) {
+        printf("Error: -wild deve estar entre 0 e 3 (recebido %d)\n", wild_count);
+        return 1;
+    }
+    if (required_count + wild_count > 12) {
+        printf("Error: -req %d + -wild %d passa de 12 palavras\n", required_count, wild_count);
+        return 1;
+    }
+    {
+        int precisa = 12 - required_count - wild_count;   // sorteadas do pool
+        int tem = (int)word_count - required_count;
+        if (tem < precisa) {
+            printf("Error: pool tem %d palavras, precisa de %d\n", tem, precisa);
+            return 1;
+        }
+    }
+    {
+        uint32_t rc = (uint32_t)required_count;
+        CUDA_CHECK(cudaMemcpyToSymbol(d_required_count, &rc, sizeof(uint32_t)));
+        uint32_t wc = (uint32_t)wild_count;
+        CUDA_CHECK(cudaMemcpyToSymbol(d_wild_count, &wc, sizeof(uint32_t)));
+    }
+    // C(n,k) para o unranking combinatorio
+    static uint64_t h_binom[41][13];
+    for (int a = 0; a <= 40; a++) {
+        for (int b = 0; b <= 12; b++) {
+            if (b == 0)      h_binom[a][b] = 1;
+            else if (b > a)  h_binom[a][b] = 0;
+            else             h_binom[a][b] = h_binom[a-1][b-1] + h_binom[a-1][b];
+        }
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(d_binom, h_binom, sizeof(h_binom)));
+
+    uint64_t total_space = h_binom[word_count - required_count][12 - required_count - wild_count]
+                           * 479001600ULL;
+    for (int w = 0; w < wild_count; w++) total_space *= 2048ULL;
     printf("Word count: %u\n", word_count);
+    if (wild_count > 0)
+        printf("Curingas: %d palavra(s) LIVRE(s) da lista completa (2048)\n", wild_count);
+    printf("Obrigatorias (%d): ", required_count);
+    for (int i = 0; i < required_count; i++) printf("%s ", wordlist[h_word_indices[i]]);
+    printf("\nPool (%u) - sorteia %d: ", word_count - required_count,
+           12 - required_count - wild_count);
+    for (uint32_t i = required_count; i < word_count; i++) printf("%s ", wordlist[h_word_indices[i]]);
+    printf("\n");
     printf("Words: ");
     for (uint32_t i = 0; i < word_count; i++) {
         printf("%s ", wordlist[h_word_indices[i]]);
@@ -797,54 +932,75 @@ int main(int argc, char** argv) {
     for (int i = 1; i <= 24; i++) h_factorials[i] = h_factorials[i-1] * i;
     
     // Copy to device
-    cudaMemcpyToSymbol(d_word_indices, h_word_indices, MAX_WORDS * sizeof(uint16_t));
-    cudaMemcpyToSymbol(d_word_count, &word_count, sizeof(uint32_t));
-    cudaMemcpyToSymbol(d_factorials, h_factorials, 25 * sizeof(uint64_t));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_word_indices, h_word_indices, MAX_WORDS * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_word_count, &word_count, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_factorials, h_factorials, 25 * sizeof(uint64_t)));
     
+    // ========================================================================
+    // Worker por GPU. Tudo declarado daqui pra baixo e LOCAL da thread, que e
+    // o necessario: cudaMalloc e por dispositivo. O resto do main() e
+    // capturado por referencia (so leitura).
+    // ========================================================================
+    auto worker = [&](int dev, uint64_t k_ini, uint64_t k_fim) -> int {
+    CUDA_CHECK(cudaSetDevice(dev));
+    cudaDeviceSetLimit(cudaLimitStackSize, 8192);
+    cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 1024 * 1024 * 32);
+    // simbolos __constant__ existem por dispositivo: reenviar em cada um
+    CUDA_CHECK(cudaMemcpyToSymbol(d_word_indices, h_word_indices, MAX_WORDS * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_word_count, &word_count, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_factorials, h_factorials, 25 * sizeof(uint64_t)));
+    {
+        uint32_t rc_ = (uint32_t)required_count;
+        CUDA_CHECK(cudaMemcpyToSymbol(d_required_count, &rc_, sizeof(uint32_t)));
+        uint32_t wc_ = (uint32_t)wild_count;
+        CUDA_CHECK(cudaMemcpyToSymbol(d_wild_count, &wc_, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_binom, h_binom, sizeof(h_binom)));
+    }
+
     // Allocate device memory
     uint16_t* d_base_indices;
-    cudaMalloc(&d_base_indices, MAX_WORDS * sizeof(uint16_t));
-    cudaMemcpy(d_base_indices, h_word_indices, MAX_WORDS * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_base_indices, MAX_WORDS * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMemcpy(d_base_indices, h_word_indices, MAX_WORDS * sizeof(uint16_t), cudaMemcpyHostToDevice));
     
     uint8_t* d_valid_flags;
-    cudaMalloc(&d_valid_flags, BATCH_SIZE);
+    CUDA_CHECK(cudaMalloc(&d_valid_flags, BATCH_SIZE));
     
     uint64_t* d_valid_count;
-    cudaMalloc(&d_valid_count, sizeof(uint64_t));
+    CUDA_CHECK(cudaMalloc(&d_valid_count, sizeof(uint64_t)));
     
     // Copy wordlist to device
     char (*d_wordlist)[16];
-    cudaMalloc(&d_wordlist, 2048 * 16);
-    cudaMemcpy(d_wordlist, wordlist, 2048 * 16, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_wordlist, 2048 * 16));
+    CUDA_CHECK(cudaMemcpy(d_wordlist, wordlist, 2048 * 16, cudaMemcpyHostToDevice));
 
     // Buffer for valid phrases (Phase 2 input)
     uint16_t* d_valid_phrases;
     // Size: Batch size * Max words. 16M * 24 * 2 bytes = 768MB. OK for 24GB VRAM.
-    cudaMalloc(&d_valid_phrases, BATCH_SIZE * MAX_WORDS * sizeof(uint16_t));
+    CUDA_CHECK(cudaMalloc(&d_valid_phrases, BATCH_SIZE * MAX_WORDS * sizeof(uint16_t)));
 
     // Found results storage
     uint32_t* d_found_count;
-    cudaMalloc(&d_found_count, sizeof(uint32_t));
-    cudaMemset(d_found_count, 0, sizeof(uint32_t));
+    CUDA_CHECK(cudaMalloc(&d_found_count, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_found_count, 0, sizeof(uint32_t)));
 
     uint8_t* d_found_privkeys;
-    cudaMalloc(&d_found_privkeys, 100 * 32); // Store up to 100 found keys
+    CUDA_CHECK(cudaMalloc(&d_found_privkeys, 100 * 32)); // Store up to 100 found keys
 
     uint16_t* d_found_indices;
-    cudaMalloc(&d_found_indices, 100 * MAX_WORDS * sizeof(uint16_t));
+    CUDA_CHECK(cudaMalloc(&d_found_indices, 100 * MAX_WORDS * sizeof(uint16_t)));
     
     // Target hashes pointers
     uint32_t use_bloom = 0;
-    cudaMemcpyToSymbol(d_use_bloom, &use_bloom, sizeof(uint32_t));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_use_bloom, &use_bloom, sizeof(uint32_t)));
     
     if (num_targets > 0) {
         uint8_t* d_targets;
-        cudaMalloc(&d_targets, target_hashes.size());
-        cudaMemcpy(d_targets, target_hashes.data(), target_hashes.size(), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMalloc(&d_targets, target_hashes.size()));
+        CUDA_CHECK(cudaMemcpy(d_targets, target_hashes.data(), target_hashes.size(), cudaMemcpyHostToDevice));
         
         // Update device symbols
-        cudaMemcpyToSymbol(d_target_hashes_ptr, &d_targets, sizeof(uint8_t*));
-        cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(uint32_t));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_target_hashes_ptr, &d_targets, sizeof(uint8_t*)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(uint32_t)));
     }
     
     printf("\n============================================================\n");
@@ -857,11 +1013,26 @@ int main(int argc, char** argv) {
     printf("Press Ctrl+C to stop\n");
     printf("============================================================\n\n");
     
-    clock_t start_time = clock();
+    if (exhaustive) {
+        printf("Modo EXAUSTIVO: %llu frases (C(%u,%d) x 12!)\n",
+               (unsigned long long)total_space, word_count - required_count, 12 - required_count);
+        printf("Cobertura garantida; retomar com -resume <k>\n");
+    } else {
+        printf("Modo ALEATORIO (sorteio com reposicao, sem garantia de cobertura)\n");
+    }
+    printf("============================================================\n\n");
+
+    // tempo de RELOGIO (clock() mede CPU e infla com varias threads)
+    auto start_time = std::chrono::steady_clock::now();
     
     // Process in batches - INFINITE LOOP for random search
-    uint64_t k = 0;
+    uint64_t k = k_ini;
     while (true) {
+        if (g_stop.load()) break;                 // outra GPU achou
+        if (exhaustive && k >= k_fim) {
+            printf("\n[GPU %d] faixa varrida por completo.\n", dev);
+            break;
+        }
         uint64_t batch = BATCH_SIZE;
         
         // Reset counter
@@ -873,9 +1044,18 @@ int main(int argc, char** argv) {
         int blocks = (batch + threads - 1) / threads;
         
         kernel_validate_checksums<<<blocks, threads>>>(
-            k, batch, d_base_indices, word_count, d_valid_flags, d_valid_count, d_valid_phrases
+            k, batch, exhaustive ? 1u : 0u, total_space,
+            d_base_indices, word_count, d_valid_flags, d_valid_count, d_valid_phrases
         );
-        cudaDeviceSynchronize();
+        {
+            cudaError_t ke = cudaDeviceSynchronize();
+            if (ke == cudaSuccess) ke = cudaGetLastError();
+            if (ke != cudaSuccess) {
+                printf("\n[X] ERRO no kernel da Fase 1: %s\n", cudaGetErrorString(ke));
+                printf("    (sem esta checagem o programa seguiria com Valid: 0 e taxa absurda)\n");
+                return 1;
+            }
+        }
         
         // Get valid count
         uint64_t valid_in_batch;
@@ -898,13 +1078,20 @@ int main(int argc, char** argv) {
                 d_found_privkeys,
                 d_found_indices
             );
-            cudaDeviceSynchronize();
-            
+            {
+                cudaError_t ke = cudaDeviceSynchronize();
+                if (ke == cudaSuccess) ke = cudaGetLastError();
+                if (ke != cudaSuccess) {
+                    printf("\n[X] ERRO no kernel da Fase 2: %s\n", cudaGetErrorString(ke));
+                    return 1;
+                }
+            }
             // Check found
             uint32_t found_now;
             cudaMemcpy(&found_now, d_found_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
             if (found_now > 0) {
                 g_found.store(found_now);
+                g_stop.store(true);
                 printf("\n[+] FOUND %u MATCHES!\n", found_now);
 
                 // O kernel guarda a frase e a chave; sem copiar de volta o
@@ -947,9 +1134,20 @@ int main(int argc, char** argv) {
         k += batch;
         
         // Display progress and samples every 10 batches
-        if ((k / BATCH_SIZE) % 10 == 0) {
-            double elapsed = (double)(clock() - start_time) / CLOCKS_PER_SEC;
+        if (dev == 0 && (k / BATCH_SIZE) % 10 == 0) {
+            double elapsed = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - start_time).count();
             double rate = g_permutations_tested / elapsed;
+            if (exhaustive) {
+                double pct = 100.0 * (double)k / (double)total_space;
+                double rate_now = g_permutations_tested.load() / elapsed;
+                double eta_h = rate_now > 0 ? (total_space - k) / rate_now / 3600.0 : 0;
+                printf("\n[EXAUSTIVO] k=%llu (%.4f%%) | restam ~%.1f h | Valid: %llu | %.2f M/s\n",
+                       (unsigned long long)k, pct, eta_h,
+                       (unsigned long long)g_valid_checksums.load(), rate_now / 1e6);
+                FILE* pf = fopen("progress.txt", "w");
+                if (pf) { fprintf(pf, "%llu\n", (unsigned long long)k); fclose(pf); }
+            }
             printf("\n[REQUIRED WORDS MODE] Tested: %llu | Valid: %llu | Speed: %.2f M/s | Elapsed: %.1fs\n",
                    (unsigned long long)g_permutations_tested.load(),
                    (unsigned long long)g_valid_checksums.load(),
@@ -979,6 +1177,58 @@ int main(int argc, char** argv) {
         }
     }
     
+    // libera os buffers DESTA GPU
+    cudaFree(d_base_indices);
+    cudaFree(d_valid_flags);
+    cudaFree(d_valid_count);
+    cudaFree(d_valid_phrases);
+    cudaFree(d_found_count);
+    cudaFree(d_found_privkeys);
+    cudaFree(d_found_indices);
+    cudaFree(d_wordlist);
+    return 0;
+    };  // fim do worker
+
+    // ------------------------------------------------------------------
+    // Dispara uma thread por GPU, fatiando o espaco entre elas.
+    // ------------------------------------------------------------------
+    int dev_count = 0;
+    cudaGetDeviceCount(&dev_count);
+    if (dev_count < 1) { printf("Nenhuma GPU CUDA encontrada\n"); return 1; }
+    int G = (n_gpus > 0 && n_gpus <= dev_count) ? n_gpus : dev_count;
+
+    printf("Usando %d GPU(s) de %d disponiveis\n", G, dev_count);
+    for (int d = 0; d < G; d++) {
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, d) == cudaSuccess)
+            printf("  GPU %d: %s\n", d, p.name);
+    }
+
+    uint64_t base_k = exhaustive ? (uint64_t)resume_k : 0;
+    uint64_t restante = (exhaustive && total_space > base_k) ? (total_space - base_k) : 0;
+    uint64_t fatia = (G > 0) ? (restante / (uint64_t)G) : restante;
+
+    if (exhaustive) {
+        printf("Espaco fatiado entre as GPUs (%llu frases cada)\n",
+               (unsigned long long)fatia);
+    }
+    printf("============================================================\n\n");
+
+    std::vector<std::thread> ths;
+    for (int d = 0; d < G; d++) {
+        uint64_t ki, kf;
+        if (exhaustive) {
+            ki = base_k + fatia * (uint64_t)d;
+            kf = (d == G - 1) ? total_space : (base_k + fatia * (uint64_t)(d + 1));
+        } else {
+            // no modo aleatorio a semente vem de k: deslocar evita caminhos iguais
+            ki = base_k + (uint64_t)d * 0x1000000000ULL;
+            kf = ~0ULL;
+        }
+        ths.emplace_back([&worker, d, ki, kf]() { worker(d, ki, kf); });
+    }
+    for (auto& t : ths) t.join();
+
     printf("\n\n============================================================\n");
     printf("SCAN COMPLETE\n");
     printf("Total permutations: %llu\n", (unsigned long long)g_permutations_tested.load());
@@ -1022,16 +1272,6 @@ int main(int argc, char** argv) {
     }
     
     printf("==============================================\n");
-    
-    // Cleanup
-    cudaFree(d_base_indices);
-    cudaFree(d_valid_flags);
-    cudaFree(d_valid_count);
-    cudaFree(d_valid_phrases);
-    cudaFree(d_found_count);
-    cudaFree(d_found_privkeys);
-    cudaFree(d_found_indices);
-    cudaFree(d_wordlist);
     
     return 0;
 }
