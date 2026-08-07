@@ -21,6 +21,7 @@
 #include <mutex>
 #include <algorithm>
 #include <chrono>
+#include <unistd.h>
 
 #include "sha256.cuh"
 #include "sha512.cuh"
@@ -856,6 +857,44 @@ uint64_t factorial(int n) {
     }                                                                          \
 } while (0)
 
+
+// ============================================================================
+// Aviso por Telegram (opcional, configurado por variavel de ambiente)
+//   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  -> ativa
+//   TELEGRAM_FULL=1                       -> inclui frase e chave na mensagem
+// Sem as variaveis, nao faz nada.
+// ============================================================================
+static bool telegram_ativo() {
+    const char* t = getenv("TELEGRAM_BOT_TOKEN");
+    const char* c = getenv("TELEGRAM_CHAT_ID");
+    return t && c && *t && *c;
+}
+
+static bool telegram_manda(const char* texto) {
+    const char* tok  = getenv("TELEGRAM_BOT_TOKEN");
+    const char* chat = getenv("TELEGRAM_CHAT_ID");
+    if (!tok || !chat || !*tok || !*chat) return false;
+
+    // texto vai por arquivo: evita qualquer problema de escape no shell
+    char tmp[] = "/tmp/lanus_tg_XXXXXX";
+    int fd = mkstemp(tmp);
+    if (fd < 0) return false;
+    FILE* f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); return false; }
+    fputs(texto, f);
+    fclose(f);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "curl -s -m 25 -o /dev/null -X POST "
+             "'https://api.telegram.org/bot%s/sendMessage' "
+             "-d chat_id=%s --data-urlencode text@%s",
+             tok, chat, tmp);
+    int rc = system(cmd);
+    unlink(tmp);
+    return rc == 0;
+}
+
 int main(int argc, char** argv) {
     printf("============================================================\n");
     printf("  BIP39 CUDA Scanner v6.0 - ULTRA SPEED MODE\n");
@@ -1162,6 +1201,17 @@ int main(int argc, char** argv) {
     } else {
         printf("Modo ALEATORIO (sorteio com reposicao, sem garantia de cobertura)\n");
     }
+    if (telegram_ativo()) {
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "lanus: busca iniciada\nalvo: %s\nobrigatorias: %d  curingas: %d\n"
+                 "(esta e a mensagem de teste - o aviso do achado usa o mesmo canal)",
+                 addr_file, required_count, wild_count);
+        printf("Telegram: %s\n", telegram_manda(msg) ? "configurado, teste enviado"
+                                                      : "configurado, mas o envio FALHOU");
+    } else {
+        printf("Telegram: desativado (defina TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID)\n");
+    }
     printf("============================================================\n\n");
 
     // tempo de RELOGIO (clock() mede CPU e infla com varias threads)
@@ -1266,6 +1316,33 @@ int main(int argc, char** argv) {
                     if (ff) fprintf(ff, "%s\t%s\n", phrase, keyhex);
                 }
                 if (ff) { fclose(ff); printf("\n  (tambem salvo em FOUND.txt)\n"); }
+
+                // aviso no Telegram
+                if (telegram_ativo()) {
+                    const char* full = getenv("TELEGRAM_FULL");
+                    char msg[1024];
+                    if (full && *full == '1') {
+                        char fr[512]; int fl = 0;
+                        for (uint32_t w = 0; w < 12; w++) {
+                            const char* wd = wordlist[h_fidx[w]];
+                            if (w) fr[fl++] = ' ';
+                            for (int c = 0; wd[c]; c++) fr[fl++] = wd[c];
+                        }
+                        fr[fl] = 0;
+                        char kx[80];
+                        for (int b = 0; b < 32; b++) sprintf(kx + b * 2, "%02x", h_fkey[b]);
+                        kx[64] = 0;
+                        snprintf(msg, sizeof(msg),
+                                 "*** LANUS ACHOU ***\n\nFrase:\n%s\n\nPrivkey:\n%s\n\n"
+                                 "Caminho: m/44'/0'/0'/0/0", fr, kx);
+                    } else {
+                        snprintf(msg, sizeof(msg),
+                                 "*** LANUS ACHOU ***\n%u resultado(s).\n"
+                                 "A frase e a chave estao em FOUND.txt na maquina.\n"
+                                 "(defina TELEGRAM_FULL=1 se quiser receber aqui)", nshow);
+                    }
+                    printf("  Telegram: %s\n", telegram_manda(msg) ? "avisado" : "FALHOU o envio");
+                }
                 fflush(stdout);
                 break;
             }
