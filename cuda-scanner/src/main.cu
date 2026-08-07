@@ -38,6 +38,10 @@
 // Configuration
 // ============================================================================
 #define BATCH_SIZE (1024 * 1024 * 16)  // 16M per batch for checksum validation
+// Quantas frases VALIDAS cabem no buffer da Fase 2. O checksum deixa passar
+// ~1/16, entao BATCH_SIZE/4 e 4x a margem esperada. Antes o buffer era
+// dimensionado para BATCH_SIZE*MAX_WORDS (1,25 GB/GPU) e usava 24 MB.
+#define VALID_CAP (BATCH_SIZE / 4)
 #define PBKDF2_BATCH_SIZE 4096         // Smaller batch for heavy PBKDF2
 #define MAX_WORDS 40
 #define PBKDF2_ITERATIONS 2048
@@ -561,9 +565,12 @@ __global__ void kernel_validate_checksums(
     if (valid) {
         uint64_t count = atomicAdd((unsigned long long*)valid_count, 1ULL);
         
-        // Store indices for Phase 2 (always 12 words)
-        for (int i = 0; i < 12; i++) {
-            valid_phrases_buffer[count * 12 + i] = indices[i];
+        // Clamp: sem isto, um batch com mais validas que a capacidade
+        // escreveria fora do buffer (estouro silencioso).
+        if (count < VALID_CAP) {
+            for (int i = 0; i < 12; i++) {
+                valid_phrases_buffer[count * 12 + i] = indices[i];
+            }
         }
     }
 }
@@ -1111,7 +1118,7 @@ int main(int argc, char** argv) {
     // Buffer for valid phrases (Phase 2 input)
     uint16_t* d_valid_phrases;
     // Size: Batch size * Max words. 16M * 24 * 2 bytes = 768MB. OK for 24GB VRAM.
-    CUDA_CHECK(cudaMalloc(&d_valid_phrases, BATCH_SIZE * MAX_WORDS * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_valid_phrases, (size_t)VALID_CAP * 12 * sizeof(uint16_t)));
 
     // Found results storage
     uint32_t* d_found_count;
@@ -1197,6 +1204,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(&valid_in_batch, d_valid_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
 
         // Phase 2: PBKDF2 + Address Check
+        if (valid_in_batch > VALID_CAP) valid_in_batch = VALID_CAP;  // o resto nao coube
         if (valid_in_batch > 0) {
             // Reset found counter before this batch
             cudaMemset(d_found_count, 0, sizeof(uint32_t));
