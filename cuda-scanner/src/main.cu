@@ -70,6 +70,9 @@ __constant__ uint16_t d_word_indices[MAX_WORDS];
 __constant__ uint32_t d_word_count;
 __constant__ uint32_t d_required_count;
 __constant__ uint32_t d_wild_count;      // palavras livres da lista de 2048
+__constant__ uint16_t d_pin[12];         // -pin: palavra fixa por posicao (0xFFFF = livre)
+__constant__ uint32_t d_pin_count;       // quantas posicoes estao fixadas
+__constant__ uint64_t d_perm_free;       // (12 - d_pin_count)!
 __constant__ uint64_t d_binom[41][13];   // C(n,k), n<=40, k<=12
 #define PERM12 479001600ULL              // 12!
 __constant__ uint64_t d_factorials[25];
@@ -253,11 +256,40 @@ __device__ void random_12word_with_required(uint64_t seed, uint32_t total_words,
         navail--;
     }
 
-    for (int i = 11; i > 0; i--) {
-        uint32_t j = cuda_rand(&seed) % (uint32_t)(i + 1);
-        uint16_t t = out_indices[i];
-        out_indices[i] = out_indices[j];
-        out_indices[j] = t;
+    if (d_pin_count == 0) {
+        for (int i = 11; i > 0; i--) {
+            uint32_t j = cuda_rand(&seed) % (uint32_t)(i + 1);
+            uint16_t t = out_indices[i];
+            out_indices[i] = out_indices[j];
+            out_indices[j] = t;
+        }
+    } else {
+        // embaralha so as palavras livres; as fixas vao direto na posicao
+        uint16_t doze[12];
+        #pragma unroll
+        for (int i = 0; i < 12; i++) doze[i] = out_indices[i];
+
+        bool used[12];
+        #pragma unroll
+        for (int i = 0; i < 12; i++) used[i] = false;
+        for (int p = 0; p < 12; p++) {
+            uint16_t w = d_pin[p];
+            if (w == 0xFFFFu) continue;
+            for (int i = 0; i < 12; i++)
+                if (!used[i] && doze[i] == w) { used[i] = true; break; }
+        }
+
+        uint16_t fr[12];
+        int nf = 0;
+        for (int i = 0; i < 12; i++) if (!used[i]) fr[nf++] = doze[i];
+        for (int i = nf - 1; i > 0; i--) {
+            uint32_t j = cuda_rand(&seed) % (uint32_t)(i + 1);
+            uint16_t t = fr[i]; fr[i] = fr[j]; fr[j] = t;
+        }
+
+        int t2 = 0;
+        for (int p = 0; p < 12; p++)
+            out_indices[p] = (d_pin[p] != 0xFFFFu) ? d_pin[p] : fr[t2++];
     }
 }
 
@@ -291,6 +323,44 @@ __device__ void unrank_perm12(uint64_t idx, const uint16_t* items, uint16_t* out
     }
 }
 
+// Coloca as 12 palavras nas posicoes, respeitando o -pin.
+// As posicoes fixas recebem a palavra dada; as livres recebem a idx-esima
+// permutacao das palavras restantes. Bijetivo sobre (12 - pin_count)!.
+__device__ void place_with_pins(uint64_t idx, const uint16_t* doze, uint16_t* out) {
+    if (d_pin_count == 0) { unrank_perm12(idx, doze, out); return; }
+
+    // marca, para cada palavra fixada, UMA ocorrencia dela em doze[]
+    bool used[12];
+    #pragma unroll
+    for (int i = 0; i < 12; i++) used[i] = false;
+    for (int p = 0; p < 12; p++) {
+        uint16_t w = d_pin[p];
+        if (w == 0xFFFFu) continue;
+        for (int i = 0; i < 12; i++)
+            if (!used[i] && doze[i] == w) { used[i] = true; break; }
+    }
+
+    // as que sobraram entram na permutacao
+    uint16_t pool[12];
+    int nfree = 0;
+    for (int i = 0; i < 12; i++) if (!used[i]) pool[nfree++] = doze[i];
+
+    uint16_t perm[12];
+    int navail = nfree;
+    for (int i = nfree; i > 0; i--) {
+        uint64_t f = d_factorials[i - 1];
+        uint32_t j = (uint32_t)(idx / f);
+        idx -= (uint64_t)j * f;
+        perm[nfree - i] = pool[j];
+        for (int m = j; m < navail - 1; m++) pool[m] = pool[m + 1];
+        navail--;
+    }
+
+    int t = 0;
+    for (int p = 0; p < 12; p++)
+        out[p] = (d_pin[p] != 0xFFFFu) ? d_pin[p] : perm[t++];
+}
+
 // k-esima frase do espaco de busca (sem repetir e sem pular).
 __device__ void kth_phrase(uint64_t k, uint32_t total_words,
                            const uint16_t* base_indices, uint16_t* out_indices) {
@@ -299,8 +369,8 @@ __device__ void kth_phrase(uint64_t k, uint32_t total_words,
     const uint32_t K = 12u - nreq - nwild;
     const uint32_t Psz = total_words - nreq;
 
-    uint64_t rest      = k / PERM12;          // (combo, curingas)
-    uint64_t perm_idx  = k - rest * PERM12;
+    uint64_t rest      = k / d_perm_free;     // (combo, curingas)
+    uint64_t perm_idx  = k - rest * d_perm_free;
 
     // desempacota os curingas (base 2048), depois a combinacao
     uint16_t wild[3];
@@ -318,7 +388,7 @@ __device__ void kth_phrase(uint64_t k, uint32_t total_words,
     for (uint32_t i = 0; i < nwild; i++) doze[nreq + i] = wild[i];
     for (uint32_t i = 0; i < K; i++)     doze[nreq + nwild + i] = base_indices[nreq + sel[i]];
 
-    unrank_perm12(perm_idx, doze, out_indices);
+    place_with_pins(perm_idx, doze, out_indices);
 }
 
 // ============================================================================
@@ -789,6 +859,9 @@ int main(int argc, char** argv) {
         printf("  -req N : as N primeiras palavras do arquivo sao OBRIGATORIAS (default 4)\n");
         printf("  -gpus N: usar N GPUs (default: todas as detectadas)\n");
         printf("  -wild N: N palavras LIVRES da lista BIP39 completa (2048)\n");
+        printf("  -pin POS:PALAVRA: fixa PALAVRA na posicao POS (1..12)\n");
+        printf("           ex: -pin 1:hazard -pin 12:source\n");
+        printf("           a palavra tem de estar entre as -req; cada pin divide o espaco\n");
         printf("           cada curinga multiplica o espaco por 2048 (max 3)\n");
         printf("  -exh   : varredura EXAUSTIVA (cobertura garantida, ~2x mais rapido\n");
         printf("           que o sorteio aleatorio no tempo esperado)\n");
@@ -808,6 +881,11 @@ int main(int argc, char** argv) {
     int exhaustive = 0;
     int n_gpus = 0;   // 0 = usar todas as detectadas
     int wild_count = 0;   // -wild N: N palavras livres das 2048
+    uint16_t h_pin[12];   // -pin POS:PALAVRA (0xFFFF = posicao livre)
+    for (int i = 0; i < 12; i++) h_pin[i] = 0xFFFFu;
+    char pin_txt[12][16];
+    for (int i = 0; i < 12; i++) pin_txt[i][0] = 0;
+    int pin_count = 0;
     unsigned long long resume_k = 0;
     
     for (int i = 1; i < argc; i++) {
@@ -818,6 +896,16 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-exh") == 0) exhaustive = 1;
         else if (strcmp(argv[i], "-gpus") == 0 && i + 1 < argc) n_gpus = atoi(argv[++i]);
         else if (strcmp(argv[i], "-wild") == 0 && i + 1 < argc) wild_count = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-pin") == 0 && i + 1 < argc) {
+            const char* spec = argv[++i];
+            const char* dp = strchr(spec, ':');
+            if (!dp) { printf("Error: -pin espera POSICAO:PALAVRA (ex: -pin 1:hazard)\n"); return 1; }
+            int pos = atoi(spec);
+            if (pos < 1 || pos > 12) { printf("Error: -pin posicao %d fora de 1..12\n", pos); return 1; }
+            if (pin_txt[pos-1][0]) { printf("Error: -pin posicao %d definida duas vezes\n", pos); return 1; }
+            snprintf(pin_txt[pos-1], 16, "%s", dp + 1);
+            pin_count++;
+        }
         else if (strcmp(argv[i], "-resume") == 0 && i + 1 < argc) resume_k = strtoull(argv[++i], NULL, 10);
     }
     
@@ -858,6 +946,41 @@ int main(int argc, char** argv) {
     uint16_t h_word_indices[MAX_WORDS];
     uint32_t word_count;
     load_target_words(words_file, wordlist, h_word_indices, &word_count);
+
+    // -pin: resolve texto -> indice BIP39 e valida
+    if (pin_count > 0) {
+        for (int p = 0; p < 12; p++) {
+            if (!pin_txt[p][0]) continue;
+            int idx = -1;
+            for (int w = 0; w < 2048; w++)
+                if (strcmp(pin_txt[p], wordlist[w]) == 0) { idx = w; break; }
+            if (idx < 0) {
+                printf("Error: -pin %d:%s -- '%s' nao e palavra BIP39\n",
+                       p + 1, pin_txt[p], pin_txt[p]);
+                return 1;
+            }
+            // tem de estar entre as obrigatorias, senao pode nao ser sorteada
+            bool obrig = false;
+            for (int r = 0; r < required_count && r < (int)word_count; r++)
+                if (h_word_indices[r] == (uint16_t)idx) { obrig = true; break; }
+            if (!obrig) {
+                printf("Error: -pin %d:%s -- essa palavra precisa estar entre as %d\n"
+                       "       obrigatorias (as primeiras do -words). Aumente o -req\n"
+                       "       ou mova '%s' para o inicio do arquivo.\n",
+                       p + 1, pin_txt[p], required_count, pin_txt[p]);
+                return 1;
+            }
+            h_pin[p] = (uint16_t)idx;
+        }
+        printf("Posicoes fixas (-pin): ");
+        for (int p = 0; p < 12; p++)
+            if (h_pin[p] != 0xFFFFu) printf("%d:%s ", p + 1, wordlist[h_pin[p]]);
+        printf("\n");
+    }
+
+    // (12 - pin_count)! -- precisa existir antes dos cudaMemcpyToSymbol
+    uint64_t h_perm_free = 1ULL;
+    for (int i = 2; i <= 12 - pin_count; i++) h_perm_free *= (uint64_t)i;
     
     if (required_count < 0 || required_count > 12) {
         printf("Error: -req deve estar entre 0 e 12 (recebido %d)\n", required_count);
@@ -892,6 +1015,10 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyToSymbol(d_required_count, &rc, sizeof(uint32_t)));
         uint32_t wc = (uint32_t)wild_count;
         CUDA_CHECK(cudaMemcpyToSymbol(d_wild_count, &wc, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_pin, h_pin, 12 * sizeof(uint16_t)));
+        uint32_t pc_a = (uint32_t)pin_count;
+        CUDA_CHECK(cudaMemcpyToSymbol(d_pin_count, &pc_a, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_perm_free, &h_perm_free, sizeof(uint64_t)));
     }
     // C(n,k) para o unranking combinatorio
     static uint64_t h_binom[41][13];
@@ -905,8 +1032,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_binom, h_binom, sizeof(h_binom)));
 
     uint64_t total_space = h_binom[word_count - required_count][12 - required_count - wild_count]
-                           * 479001600ULL;
+                           * h_perm_free;
     for (int w = 0; w < wild_count; w++) total_space *= 2048ULL;
+    if (pin_count > 0)
+        printf("Permutacoes: %llu (12! dividido por %llu por causa dos %d pin)\n",
+               (unsigned long long)h_perm_free,
+               (unsigned long long)(479001600ULL / h_perm_free), pin_count);
     printf("Word count: %u\n", word_count);
     if (wild_count > 0)
         printf("Curingas: %d palavra(s) LIVRE(s) da lista completa (2048)\n", wild_count);
@@ -954,6 +1085,10 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyToSymbol(d_required_count, &rc_, sizeof(uint32_t)));
         uint32_t wc_ = (uint32_t)wild_count;
         CUDA_CHECK(cudaMemcpyToSymbol(d_wild_count, &wc_, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_pin, h_pin, 12 * sizeof(uint16_t)));
+        uint32_t pc_b = (uint32_t)pin_count;
+        CUDA_CHECK(cudaMemcpyToSymbol(d_pin_count, &pc_b, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_perm_free, &h_perm_free, sizeof(uint64_t)));
         CUDA_CHECK(cudaMemcpyToSymbol(d_binom, h_binom, sizeof(h_binom)));
     }
 
