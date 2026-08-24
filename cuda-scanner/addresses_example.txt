@@ -1,0 +1,8 @@
+# Exemplo de arquivo de endereços alvo
+# Um endereço por linha
+# Suporta formatos: Legacy (1...), P2SH (3...), SegWit (bc1q...)
+
+bc1qxsd68d42agvykdueutm228uzn4s2g9qp2kk7t8
+1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2
+3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy
+bc1q42lja79elem0anu8q8s3h2n687re9jax556pcc

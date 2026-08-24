@@ -1,0 +1,25 @@
+btc1.txt
+*.exe
+*.obj
+*.pdb
+*.lib
+*.exp
+build/
+.vscode/
+
+# variantes locais de busca e resultados (config pessoal - nao versionar)
+cuda-scanner/src/main_search*.cu
+cuda-scanner/src/main_*needle*.cu
+cuda-scanner/src/main_n*.cu
+FOUND.txt
+words22.txt
+
+# backups e logs de trabalho
+*.bak
+*.bak2
+*.pre_*
+*.orig
+busca.log
+gpu*.log
+nohup.out
+main.cu.bak_exh

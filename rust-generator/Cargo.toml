@@ -1,0 +1,28 @@
+[package]
+name = "bip39-dataset-generator"
+version = "1.0.0"
+edition = "2021"
+description = "Gera dataset de frases BIP39 válidas para processamento CUDA"
+
+[dependencies]
+bip39 = "2.0"
+sha2 = "0.10"
+rayon = "1.8"
+num_cpus = "1.16"
+clap = { version = "4.4", features = ["derive"] }
+indicatif = "0.17"
+byteorder = "1.5"
+memmap2 = "0.9"
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug-assertions = false
+
+[profile.release.build-override]
+opt-level = 3
