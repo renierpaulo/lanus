@@ -1,16 +1,14 @@
 /*
- * secp256k1 rapido: multiplicacao escalar de BASE FIXA (k*G) com janela de 4 bits.
+ * secp256k1 rapido: multiplicacao escalar de BASE FIXA (k*G) com janela LARGA.
  *
- * O caminho antigo (scalar_mult) fazia double-and-add binario:
- *   256 point_double + ~128 point_add  ~= 6100 mulmod por chave publica.
- * Aqui: 64 janelas de 4 bits, uma adicao mista (Jacobiana + afim) por janela
- * nao-nula  ~= 60 adicoes * 11 mulmod ~= 660 mulmod.  ~9x menos.
+ * v3 (wide-window): tabela nova com janelas de GT_WBITS=12 bits gerada e
+ * verificada em Python (gen_gtable_w.py: scan == double-and-add em chaves
+ * aleatorias). Janelas 4-bit -> 12-bit corta as adicoes mistas por chave de
+ * ~60 para <=22 (media ~20.6), cada uma custando 11 mulmod (madd-2007-bl).
+ * Tabela: 22 x 4095 pontos afins (~5.8 MB), residente em L2.
  *
- * A tabela d_gtable[i][j] = (j+1)*16^i*G vem pre-computada e validada
- * (gen_gtable.py confere contra multiplicacao escalar independente).
- *
- * A inversao usa a cadeia de adicao do secp256k1 (255 quadrados + 15 mults)
- * no lugar do square-and-multiply generico (256 quadrados + ~128 mults).
+ * A inversao continua pela cadeia de adicao do secp256k1 (255 quadrados +
+ * 15 mults) no lugar do square-and-multiply generico.
  */
 
 #ifndef SECP256K1_FAST_CUH
@@ -18,7 +16,7 @@
 
 #include <stdint.h>
 #include "secp256k1.cuh"     // uint256_t, uint256_mod_*, SECP256K1_P
-#include "secp_gtable.cuh"   // d_gtable
+#include "secp_gtable_w.cuh" // d_gtable, GT_WBITS, GT_NWIN, GT_NPT
 
 __device__ __forceinline__ void fe_mul(uint256_t* r, const uint256_t* a, const uint256_t* b) {
     uint256_mod_mul(r, a, b, &SECP256K1_P);
@@ -112,7 +110,7 @@ __device__ __forceinline__ bool fe_is_zero(const uint256_t* a) {
     return (a->d[0]|a->d[1]|a->d[2]|a->d[3]|a->d[4]|a->d[5]|a->d[6]|a->d[7]) == 0;
 }
 
-// Le o ponto afim T[win][idx] da tabela (idx 0..14 -> (idx+1)*16^win*G).
+// Le o ponto afim T[win][idx] da tabela (idx 0..GT_NPT-1 -> (idx+1)*B^win*G).
 __device__ __forceinline__ void gtable_load(int win, int idx, uint256_t* x, uint256_t* y) {
     const uint32_t* p = d_gtable + ((win * GT_NPT) + idx) * 16;
     #pragma unroll
@@ -191,8 +189,8 @@ __device__ void jpoint_add_affine(jpoint_t* P, const uint256_t* qx, const uint25
 }
 
 // ---------------------------------------------------------------------------
-// Chave publica comprimida a partir da privada — caminho rapido de base fixa.
-// Substitui secp256k1_get_pubkey_compressed().
+// Chave publica comprimida a partir da privada — caminho rapido de base fixa,
+// agora com janelas de GT_WBITS bits sobre a tabela larga.
 // ---------------------------------------------------------------------------
 __device__ void secp256k1_pubkey_fast(const uint8_t* privkey, uint8_t* pubkey) {
     uint256_t k;
@@ -204,9 +202,19 @@ __device__ void secp256k1_pubkey_fast(const uint8_t* privkey, uint8_t* pubkey) {
     uint256_t qx, qy;
     #pragma unroll 1
     for (int win = 0; win < GT_NWIN; win++) {
-        uint32_t d = (k.d[win >> 3] >> ((win & 7) * 4)) & 0xF;
+        // digito de GT_WBITS bits; pode cruzar duas palavras de 32 bits.
+        const uint32_t bit = (uint32_t)win * GT_WBITS;
+        const uint32_t lo  = bit & 31u;
+        const uint32_t li  = bit >> 5;
+        uint32_t v = k.d[li] >> lo;
+        // quando o digito cruza a fronteira, sobe bits da palavra seguinte.
+        // (lo + GT_WBITS > 32 => lo > 20 => o deslocamento 32-lo esta em [1,11].)
+        // Na ultima janela o pedaco que passaria de 256 bits e zero por definicao.
+        if (lo + GT_WBITS > 32u && li < 7u)
+            v |= k.d[li + 1] << (32u - lo);
+        const uint32_t d = v & (GT_BASE - 1u);
         if (d) {
-            gtable_load(win, d - 1, &qx, &qy);
+            gtable_load(win, (int)d - 1, &qx, &qy);
             jpoint_add_affine(&P, &qx, &qy);
         }
     }

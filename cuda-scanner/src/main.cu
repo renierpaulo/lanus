@@ -43,6 +43,26 @@
 // ~1/16, entao BATCH_SIZE/4 e 4x a margem esperada. Antes o buffer era
 // dimensionado para BATCH_SIZE*MAX_WORDS (1,25 GB/GPU) e usava 24 MB.
 #define VALID_CAP (BATCH_SIZE / 4)
+
+// ============================================================================
+// MODO HARDCORE: configuracao congelada em tempo de compilacao (estilo
+// especializacao Taalas aplicada ao software): zero flexibilidade no caminho
+// quente. Ativar com -DLANUS_HARDCORE_REQ=4 (e opcionalmente outros).
+// ============================================================================
+#ifdef LANUS_HARDCORE_REQ
+#define HC_REQ  ((uint32_t)LANUS_HARDCORE_REQ)
+#define HC_WILD ((uint32_t)0)
+#define HC_PINS ((uint32_t)0)
+#define HC_PERM_FREE 479001600ULL   // 12!
+static_assert(LANUS_HARDCORE_REQ >= 0 && LANUS_HARDCORE_REQ <= 12, "-req invalido");
+#else
+#define HC_REQ  d_required_count
+#define HC_WILD d_wild_count
+#define HC_PINS d_pin_count
+#define HC_PERM_FREE d_perm_free
+#endif
+
+
 #define PBKDF2_BATCH_SIZE 4096         // Smaller batch for heavy PBKDF2
 #define MAX_WORDS 40
 #define PBKDF2_ITERATIONS 2048
@@ -332,7 +352,11 @@ __device__ void unrank_perm12(uint64_t idx, const uint16_t* items, uint16_t* out
 // As posicoes fixas recebem a palavra dada; as livres recebem a idx-esima
 // permutacao das palavras restantes. Bijetivo sobre (12 - pin_count)!.
 __device__ void place_with_pins(uint64_t idx, const uint16_t* doze, uint16_t* out) {
+#ifdef LANUS_HARDCORE_REQ
+    unrank_perm12(idx, doze, out);   // HC: pins=0 congelado
+#else
     if (d_pin_count == 0) { unrank_perm12(idx, doze, out); return; }
+#endif
 
     // marca, para cada palavra fixada, UMA ocorrencia dela em doze[]
     bool used[12];
@@ -369,6 +393,22 @@ __device__ void place_with_pins(uint64_t idx, const uint16_t* doze, uint16_t* ou
 // k-esima frase do espaco de busca (sem repetir e sem pular).
 __device__ void kth_phrase(uint64_t k, uint32_t total_words,
                            const uint16_t* base_indices, uint16_t* out_indices) {
+#ifdef LANUS_HARDCORE_REQ
+    constexpr uint32_t nreq  = HC_REQ;      // congelado em compile-time
+    constexpr uint32_t nwild = 0;
+    constexpr uint32_t K     = 12u - nreq;
+    constexpr uint32_t Psz   = 40u - nreq;
+    constexpr uint64_t PERM_FREE = 479001600ULL;
+
+    uint64_t perm_idx  = k % PERM_FREE;      // sem curingas: k mapeia direto
+    uint8_t sel[12];
+    unrank_combo(k / PERM_FREE, Psz, K, sel);
+    uint16_t doze[12];
+    #pragma unroll
+    for (uint32_t i = 0; i < nreq; i++) doze[i] = base_indices[i];
+    #pragma unroll
+    for (uint32_t i = 0; i < K; i++)    doze[nreq + i] = base_indices[nreq + sel[i]];
+#else
     const uint32_t nreq  = d_required_count;
     const uint32_t nwild = d_wild_count;
     const uint32_t K = 12u - nreq - nwild;
@@ -377,7 +417,6 @@ __device__ void kth_phrase(uint64_t k, uint32_t total_words,
     uint64_t rest      = k / d_perm_free;     // (combo, curingas)
     uint64_t perm_idx  = k - rest * d_perm_free;
 
-    // desempacota os curingas (base 2048), depois a combinacao
     uint16_t wild[3];
     for (uint32_t i = 0; i < nwild; i++) {
         wild[i] = (uint16_t)(rest % 2048ULL);
@@ -392,6 +431,7 @@ __device__ void kth_phrase(uint64_t k, uint32_t total_words,
     for (uint32_t i = 0; i < nreq; i++)  doze[i] = base_indices[i];
     for (uint32_t i = 0; i < nwild; i++) doze[nreq + i] = wild[i];
     for (uint32_t i = 0; i < K; i++)     doze[nreq + nwild + i] = base_indices[nreq + sel[i]];
+#endif
 
     place_with_pins(perm_idx, doze, out_indices);
 }
@@ -602,33 +642,26 @@ __device__ __forceinline__ void pack_mnemonic_words(
 }
 
 // ============================================================================
-// KERNEL 2: Full derivation for valid phrases
+// KERNEL 2a: PBKDF2 isolado — a fase pesada fica sozinha no registro,
+// sem carregar o estado da derivacao BIP32 (derruba pressao de registrador).
 // ============================================================================
-__global__ void kernel_derive_and_check(
-    const uint16_t* valid_phrases,  // Packed valid phrase indices
+__global__ void __launch_bounds__(128, 4)
+kernel_pbkdf2_seed(
+    const uint16_t* valid_phrases,
     uint32_t num_valid,
-    uint32_t word_count,
     char wordlist[2048][16],
-    uint32_t* found_count,
-    uint8_t* found_privkeys,
-    uint16_t* found_indices
+    uint8_t* seeds
 ) {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_valid) return;
-    
-    // Always process 12 words in this mode
+
     const uint16_t* indices = valid_phrases + tid * 12;
-    
-    
-    // Monta a frase direto no formato do PBKDF2 (16 x uint64): sai o array de
-    // 256 bytes em memoria local E o reempacotamento byte->uint64 do pbkdf2.
+
+    // Monta a frase direto no formato do PBKDF2 (16 x uint64 big-endian).
     uint64_t kw[16];
     pack_mnemonic_words(indices, wordlist, kw);
-    
 
-    
-    // Debug: imprime a primeira frase (kw esta empacotado em uint64 big-endian)
-    #if DEBUG_MODE
+#if DEBUG_MODE
     if (tid == 0) {
         char dbg[129];
         for (int i = 0; i < 16; i++)
@@ -638,28 +671,36 @@ __global__ void kernel_derive_and_check(
         printf("[DEBUG] MNEMONIC: %s\n", dbg);
         printf("[DEBUG] INDICES: ");
         for (int w = 0; w < 12; w++) printf("%d ", indices[w]);
-        printf("\n");
+        printf("
+");
     }
-    #endif
-    
-    // PBKDF2-SHA512 to derive seed
-    uint8_t seed[64];
-    
-    // BIP39: PBKDF2(password=mnemonic, salt="mnemonic", iterations=2048)
-    // Pass mnemonic directly with its length
-    pbkdf2_bip39_packed(kw, PBKDF2_ITERATIONS, seed);
+#endif
 
+    // BIP39: PBKDF2(password=frase, salt="mnemonic", iterations=2048)
+    pbkdf2_bip39_packed(kw, PBKDF2_ITERATIONS, seeds + tid * 64);
+}
 
+// ============================================================================
+// KERNEL 2b: derivacao BIP32 + endereco + comparacao de alvo.
+// Le a semente pronta do buffer; mesmo comportamento do kernel antigo.
+// ============================================================================
+__global__ void __launch_bounds__(256)
+kernel_derive_check(
+    const uint16_t* valid_phrases,
+    const uint8_t* seeds,
+    uint32_t num_valid,
+    uint32_t word_count,
+    uint32_t* found_count,
+    uint8_t* found_privkeys,
+    uint16_t* found_indices
+) {
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_valid) return;
 
-    
-    #if DEBUG_MODE
-    if (tid == 0) {
-        printf("[DEBUG] SEED: ");
-        for(int k=0; k<32; k++) printf("%02x", seed[k]);
-        printf("...\n");
-    }
-    #endif
-    
+    // Always process 12 words in this mode
+    const uint16_t* indices = valid_phrases + tid * 12;
+    const uint8_t* seed = seeds + tid * 64;
+
     // Derive master key
     uint8_t master_key[32], master_chaincode[32];
     {
@@ -1159,6 +1200,10 @@ int main(int argc, char** argv) {
     // Size: Batch size * Max words. 16M * 24 * 2 bytes = 768MB. OK for 24GB VRAM.
     CUDA_CHECK(cudaMalloc(&d_valid_phrases, (size_t)VALID_CAP * 12 * sizeof(uint16_t)));
 
+    // Sementes PBKDF2 por sobrevivente (64B cada) — separa a fase pesada
+    uint8_t* d_seeds;
+    CUDA_CHECK(cudaMalloc(&d_seeds, (size_t)VALID_CAP * 64));
+
     // Found results storage
     uint32_t* d_found_count;
     CUDA_CHECK(cudaMalloc(&d_found_count, sizeof(uint32_t)));
@@ -1262,11 +1307,26 @@ int main(int argc, char** argv) {
             int threads_p2 = 256;
             int blocks_p2 = (valid_in_batch + threads_p2 - 1) / threads_p2;
             
-            kernel_derive_and_check<<<blocks_p2, threads_p2>>>(
+            int blocks_2a = (int)((valid_in_batch + 127) / 128);
+            kernel_pbkdf2_seed<<<blocks_2a, 128>>>(
                 d_valid_phrases,
                 (uint32_t)valid_in_batch,
-                word_count,
                 d_wordlist,
+                d_seeds
+            );
+            {
+                cudaError_t ke = cudaDeviceSynchronize();
+                if (ke == cudaSuccess) ke = cudaGetLastError();
+                if (ke != cudaSuccess) {
+                    printf("\n[X] ERRO no kernel PBKDF2 (Fase 2a): %s\n", cudaGetErrorString(ke));
+                    return 1;
+                }
+            }
+            kernel_derive_check<<<blocks_p2, threads_p2>>>(
+                d_valid_phrases,
+                d_seeds,
+                (uint32_t)valid_in_batch,
+                word_count,
                 d_found_count,
                 d_found_privkeys,
                 d_found_indices
@@ -1402,6 +1462,7 @@ int main(int argc, char** argv) {
     cudaFree(d_valid_flags);
     cudaFree(d_valid_count);
     cudaFree(d_valid_phrases);
+    cudaFree(d_seeds);
     cudaFree(d_found_count);
     cudaFree(d_found_privkeys);
     cudaFree(d_found_indices);

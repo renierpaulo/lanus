@@ -3,7 +3,7 @@
 
 NVCC = nvcc
 # Ajuste a arquitetura conforme necessário (sm_89 = RTX 4090, sm_90 = H100/Blackwell)
-ARCH = sm_89
+ARCH = sm_120
 NVCC_FLAGS = -O3 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3"
 
 SRC_DIR = src
