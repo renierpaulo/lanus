@@ -238,3 +238,43 @@ __device__ void secp256k1_pubkey_fast(const uint8_t* privkey, uint8_t* pubkey) {
 }
 
 #endif // SECP256K1_FAST_CUH
+
+// Variante ETH: publica X e Y SEPARADOS (64 bytes, sem prefixo).
+__device__ void secp256k1_pubkey_fast_uncompressed(const uint8_t* privkey, uint8_t* out64) {
+    uint256_t k;
+    bytes_to_uint256(&k, privkey);
+
+    jpoint_t P;
+    uint256_clear(&P.X); uint256_clear(&P.Y); uint256_clear(&P.Z);
+
+    uint256_t qx, qy;
+    #pragma unroll 1
+    for (int win = 0; win < GT_NWIN; win++) {
+        const uint32_t bit = (uint32_t)win * GT_WBITS;
+        const uint32_t lo  = bit & 31u;
+        const uint32_t li  = bit >> 5;
+        uint32_t v = k.d[li] >> lo;
+        if (lo + GT_WBITS > 32u && li < 7u)
+            v |= k.d[li + 1] << (32u - lo);
+        const uint32_t d = v & (GT_BASE - 1u);
+        if (d) {
+            gtable_load(win, (int)d - 1, &qx, &qy);
+            jpoint_add_affine(&P, &qx, &qy);
+        }
+    }
+
+    if (fe_is_zero(&P.Z)) {
+        for (int i = 0; i < 64; i++) out64[i] = 0;
+        return;
+    }
+
+    uint256_t zinv, z2, z3, xa, ya;
+    fe_inv_chain(&zinv, &P.Z);
+    fe_sqr(&z2, &zinv);
+    fe_mul(&z3, &z2, &zinv);
+    fe_mul(&xa, &P.X, &z2);
+    fe_mul(&ya, &P.Y, &z3);
+
+    uint256_to_bytes(out64, &xa);
+    uint256_to_bytes(out64 + 32, &ya);
+}

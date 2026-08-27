@@ -28,6 +28,7 @@
 #include "ripemd160.cuh"
 #include "secp256k1.cuh"
 #include "base58.cuh"
+#include "keccak256.cuh"
 #include "bip39.cuh"
 #include "pbkdf2_opt.cuh"
 #include "sha512_opt.cuh"
@@ -44,23 +45,6 @@
 // dimensionado para BATCH_SIZE*MAX_WORDS (1,25 GB/GPU) e usava 24 MB.
 #define VALID_CAP (BATCH_SIZE / 4)
 
-// ============================================================================
-// MODO HARDCORE: configuracao congelada em tempo de compilacao (estilo
-// especializacao Taalas aplicada ao software): zero flexibilidade no caminho
-// quente. Ativar com -DLANUS_HARDCORE_REQ=4 (e opcionalmente outros).
-// ============================================================================
-#ifdef LANUS_HARDCORE_REQ
-#define HC_REQ  ((uint32_t)LANUS_HARDCORE_REQ)
-#define HC_WILD ((uint32_t)0)
-#define HC_PINS ((uint32_t)0)
-#define HC_PERM_FREE 479001600ULL   // 12!
-static_assert(LANUS_HARDCORE_REQ >= 0 && LANUS_HARDCORE_REQ <= 12, "-req invalido");
-#else
-#define HC_REQ  d_required_count
-#define HC_WILD d_wild_count
-#define HC_PINS d_pin_count
-#define HC_PERM_FREE d_perm_free
-#endif
 
 
 #define PBKDF2_BATCH_SIZE 4096         // Smaller batch for heavy PBKDF2
@@ -111,6 +95,7 @@ __constant__ uint32_t d_use_bloom;
 // Target hashes
 __constant__ uint8_t* d_target_hashes_ptr = nullptr;
 __constant__ uint32_t d_num_targets;
+__constant__ uint32_t d_coin;   // 0 = BTC, 60 = ETH
 
 // SHA-256 K constants are in sha256.cuh
 // hmac_sha512 is in sha512.cuh
@@ -352,11 +337,7 @@ __device__ void unrank_perm12(uint64_t idx, const uint16_t* items, uint16_t* out
 // As posicoes fixas recebem a palavra dada; as livres recebem a idx-esima
 // permutacao das palavras restantes. Bijetivo sobre (12 - pin_count)!.
 __device__ void place_with_pins(uint64_t idx, const uint16_t* doze, uint16_t* out) {
-#ifdef LANUS_HARDCORE_REQ
-    unrank_perm12(idx, doze, out);   // HC: pins=0 congelado
-#else
     if (d_pin_count == 0) { unrank_perm12(idx, doze, out); return; }
-#endif
 
     // marca, para cada palavra fixada, UMA ocorrencia dela em doze[]
     bool used[12];
@@ -393,22 +374,6 @@ __device__ void place_with_pins(uint64_t idx, const uint16_t* doze, uint16_t* ou
 // k-esima frase do espaco de busca (sem repetir e sem pular).
 __device__ void kth_phrase(uint64_t k, uint32_t total_words,
                            const uint16_t* base_indices, uint16_t* out_indices) {
-#ifdef LANUS_HARDCORE_REQ
-    constexpr uint32_t nreq  = HC_REQ;      // congelado em compile-time
-    constexpr uint32_t nwild = 0;
-    constexpr uint32_t K     = 12u - nreq;
-    constexpr uint32_t Psz   = 40u - nreq;
-    constexpr uint64_t PERM_FREE = 479001600ULL;
-
-    uint64_t perm_idx  = k % PERM_FREE;      // sem curingas: k mapeia direto
-    uint8_t sel[12];
-    unrank_combo(k / PERM_FREE, Psz, K, sel);
-    uint16_t doze[12];
-    #pragma unroll
-    for (uint32_t i = 0; i < nreq; i++) doze[i] = base_indices[i];
-    #pragma unroll
-    for (uint32_t i = 0; i < K; i++)    doze[nreq + i] = base_indices[nreq + sel[i]];
-#else
     const uint32_t nreq  = d_required_count;
     const uint32_t nwild = d_wild_count;
     const uint32_t K = 12u - nreq - nwild;
@@ -431,7 +396,6 @@ __device__ void kth_phrase(uint64_t k, uint32_t total_words,
     for (uint32_t i = 0; i < nreq; i++)  doze[i] = base_indices[i];
     for (uint32_t i = 0; i < nwild; i++) doze[nreq + i] = wild[i];
     for (uint32_t i = 0; i < K; i++)     doze[nreq + nwild + i] = base_indices[nreq + sel[i]];
-#endif
 
     place_with_pins(perm_idx, doze, out_indices);
 }
@@ -729,8 +693,8 @@ kernel_derive_check(
     derive_child_key(master_key, master_chaincode, 44, key, chaincode, true, false);
     // Debug disabled for m/44'
     
-    // m/44'/0'
-    derive_child_key(key, chaincode, 0, temp_key, temp_chaincode, true, false);
+    // m/44'/coin'
+    derive_child_key(key, chaincode, (d_coin == 60u ? 60u : 0u), temp_key, temp_chaincode, true, false);
     memcpy(key, temp_key, 32); memcpy(chaincode, temp_chaincode, 32);
     // Debug disabled for m/44'/0'
 
@@ -747,14 +711,21 @@ kernel_derive_check(
     derive_child_key(key, chaincode, 0, private_key, temp_chaincode, false, false);
     
     // Get public key hash
-    uint8_t pubkey[33];
-    secp256k1_pubkey_fast(private_key, pubkey);
-
-    uint8_t sha_hash[32];
-    sha256(pubkey, 33, sha_hash);
-    
     uint8_t pubkey_hash[20];
-    ripemd160(sha_hash, 32, pubkey_hash);
+    if (d_coin == 60u) {
+        // ETH: endereco = keccak256(X||Y)[12..32)
+        uint8_t pubU[64], kout[32];
+        secp256k1_pubkey_fast_uncompressed(private_key, pubU);
+        keccak256(pubU, 64, kout);
+        memcpy(pubkey_hash, kout + 12, 20);
+    } else {
+        // BTC: hash160(compressed pubkey)
+        uint8_t pubkey[33];
+        secp256k1_pubkey_fast(private_key, pubkey);
+        uint8_t sha_hash[32];
+        sha256(pubkey, 33, sha_hash);
+        ripemd160(sha_hash, 32, pubkey_hash);
+    }
     
 
     
@@ -942,7 +913,8 @@ int main(int argc, char** argv) {
     printf("============================================================\n");
     
     if (argc < 3) {
-        printf("Usage: %s -words <words.txt> -a <addresses.txt> [-req N] [--bloom <MB>]\n", argv[0]);
+        printf("Usage: %s -words <words.txt> -a <addresses.txt> [-req N] [--bloom <MB>] [-coin btc|eth]\n", argv[0]);
+        printf("  -coin S: btc (default) ou eth — moeda alvo\n");
         printf("  -req N : as N primeiras palavras do arquivo sao OBRIGATORIAS (default 4)\n");
         printf("  -gpus N: usar N GPUs (default: todas as detectadas)\n");
         printf("  -wild N: N palavras LIVRES da lista BIP39 completa (2048)\n");
@@ -974,6 +946,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 12; i++) pin_txt[i][0] = 0;
     int pin_count = 0;
     unsigned long long resume_k = 0;
+    int coin_type = 0;   // 0 = BTC (default), 60 = ETH
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-words") == 0 && i + 1 < argc) words_file = argv[++i];
@@ -981,6 +954,12 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--bloom") == 0 && i + 1 < argc) bloom_mb = atoi(argv[++i]);
         else if (strcmp(argv[i], "-req") == 0 && i + 1 < argc) required_count = atoi(argv[++i]);
         else if (strcmp(argv[i], "-exh") == 0) exhaustive = 1;
+        else if (strcmp(argv[i], "-coin") == 0 && i + 1 < argc) {
+            ++i;
+            if (strcmp(argv[i], "btc") == 0 || strcmp(argv[i], "BTC") == 0) coin_type = 0;
+            else if (strcmp(argv[i], "eth") == 0 || strcmp(argv[i], "ETH") == 0) coin_type = 60;
+            else { printf("Error: -coin aceita btc ou eth\n"); return 1; }
+        }
         else if (strcmp(argv[i], "-gpus") == 0 && i + 1 < argc) n_gpus = atoi(argv[++i]);
         else if (strcmp(argv[i], "-wild") == 0 && i + 1 < argc) wild_count = atoi(argv[++i]);
         else if (strcmp(argv[i], "-pin") == 0 && i + 1 < argc) {
@@ -1013,8 +992,26 @@ int main(int argc, char** argv) {
             if (strlen(line) < 20) continue;
             
             uint8_t hash[20];
-            if (base58_decode_address(line, hash)) {
+            bool okaddr = false;
+            if (coin_type == 60 && strlen(line) >= 40) {
+                // formato hex 0x... ou puro (40 chars)
+                const char* hp = line;
+                if (hp[0]=='0' && (hp[1]=='x'||hp[1]=='X')) hp += 2;
+                if (strlen(hp) >= 40) okaddr = true;
+                for (int q = 0; okaddr && q < 20; q++) {
+                    char h1=hp[2*q],h2=hp[2*q+1];
+                    auto hv=[](char c)->uint8_t{return (uint8_t)((c<='9')?c-'0':((c|32)-'a'+10));};
+                    if (!((h1>='0'&&h1<='9')||(h1|32)>='a'&&(h1|32)<='f')) {okaddr=false;break;}
+                    if (!((h2>='0'&&h2<='9')||(h2|32)>='a'&&(h2|32)<='f')) {okaddr=false;break;}
+                    hash[q]=(uint8_t)((hv(h1)<<4)|hv(h2));
+                }
+            }
+            if (!okaddr && base58_decode_address(line, hash)) {
+                okaddr = true;
                 for(int i=0; i<20; i++) target_hashes.push_back(hash[i]);
+            }
+            if (okaddr && coin_type==60) {
+                for(int q=0;q<20;q++) target_hashes.push_back(hash[q]);
             }
         }
         fclose(f_addr);
@@ -1227,6 +1224,8 @@ int main(int argc, char** argv) {
         // Update device symbols
         CUDA_CHECK(cudaMemcpyToSymbol(d_target_hashes_ptr, &d_targets, sizeof(uint8_t*)));
         CUDA_CHECK(cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(uint32_t)));
+    uint32_t hc = (uint32_t)coin_type;
+    CUDA_CHECK(cudaMemcpyToSymbol(d_coin, &hc, sizeof(uint32_t)));
     }
     
     printf("\n============================================================\n");
@@ -1372,7 +1371,7 @@ int main(int argc, char** argv) {
                     printf("\n*** FRASE ENCONTRADA ***\n");
                     printf("  Frase   : %s\n", phrase);
                     printf("  Privkey : %s\n", keyhex);
-                    printf("  Caminho : m/44'/0'/0'/0/0\n");
+                    if (coin_type == 60) printf("  Caminho : m/44'/60'/0'/0/0 (ETH)\n"); else printf("  Caminho : m/44'/0'/0'/0/0 (BTC)\n");
                     if (ff) fprintf(ff, "%s\t%s\n", phrase, keyhex);
                 }
                 if (ff) { fclose(ff); printf("\n  (tambem salvo em FOUND.txt)\n"); }
